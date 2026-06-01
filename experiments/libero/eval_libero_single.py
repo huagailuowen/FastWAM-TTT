@@ -465,6 +465,8 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    if hasattr(model, "reset_video_ttt_state"):
+        model.reset_video_ttt_state()
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()

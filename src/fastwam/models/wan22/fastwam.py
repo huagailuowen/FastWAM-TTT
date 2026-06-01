@@ -11,6 +11,7 @@ from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from .video_ttt import VideoTTTQKVAdapter
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_video_ttt: float = 0.0,
+        video_ttt_config: Optional[dict[str, Any]] = None,
+        video_ttt_observation_training: bool = False,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,6 +88,21 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_video_ttt = float(loss_lambda_video_ttt)
+        self.video_ttt_observation_training = bool(video_ttt_observation_training)
+        self._video_ttt_inference_state: Optional[dict[str, torch.Tensor]] = None
+
+        video_ttt_config = {} if video_ttt_config is None else dict(video_ttt_config)
+        self.video_ttt_train_backbone = bool(video_ttt_config.get("train_backbone", False))
+        if bool(video_ttt_config.get("enabled", False)):
+            video_ttt_adapter = VideoTTTQKVAdapter(
+                hidden_dim=int(self.video_expert.hidden_dim),
+                num_heads=int(self.video_expert.num_heads),
+                mini_batch_size=int(video_ttt_config.get("mini_batch_size", 64)),
+                ttt_lr=float(video_ttt_config.get("ttt_lr", 0.1)),
+                init_std=float(video_ttt_config.get("init_std", 0.02)),
+            ).to(dtype=torch_dtype)
+            self.mot.add_module("video_ttt_adapter", video_ttt_adapter)
 
         self.to(self.device)
 
@@ -111,6 +130,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_video_ttt: float = 0.0,
+        video_ttt_config: Optional[dict[str, Any]] = None,
+        video_ttt_observation_training: bool = False,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +190,9 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_video_ttt=loss_lambda_video_ttt,
+            video_ttt_config=video_ttt_config,
+            video_ttt_observation_training=video_ttt_observation_training,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -187,6 +212,39 @@ class FastWAM(torch.nn.Module):
             self.text_encoder.to(*args, **kwargs)
         self.vae.to(*args, **kwargs)
         return self
+
+    def _get_video_ttt_adapter(self) -> Optional[VideoTTTQKVAdapter]:
+        adapter = getattr(self.mot, "video_ttt_adapter", None)
+        if adapter is None:
+            return None
+        if not isinstance(adapter, VideoTTTQKVAdapter):
+            raise TypeError(f"`mot.video_ttt_adapter` must be VideoTTTQKVAdapter, got {type(adapter)}.")
+        return adapter
+
+    @property
+    def video_ttt_enabled(self) -> bool:
+        return self._get_video_ttt_adapter() is not None
+
+    def reset_video_ttt_state(self) -> None:
+        """Reset inference-time fast weights at an episode/task boundary."""
+        self._video_ttt_inference_state = None
+
+    def _apply_video_ttt_observation(
+        self,
+        video_tokens: torch.Tensor,
+        *,
+        state: Optional[dict[str, torch.Tensor]],
+        persist_state: bool,
+        update: bool = True,
+    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None:
+            return video_tokens, state, None
+
+        adapted_tokens, new_state, ttt_loss = adapter(video_tokens, state=state, update=update)
+        if persist_state:
+            self._video_ttt_inference_state = adapter.detach_state(new_state)
+        return adapted_tokens, new_state, ttt_loss
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -445,7 +503,127 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
+    def training_loss_video_ttt_observation(self, sample, tiled: bool = False):
+        """Inference-matched first-version TTT training.
+
+        This path updates the video TTT fast weights from the observed frame only,
+        then trains action denoising through the same video-cache action path used
+        by `infer_action`. It intentionally does not predict future video.
+        """
+        if not self.video_ttt_enabled:
+            raise ValueError("`training_loss_video_ttt_observation` requires `model.video_ttt.enabled=true`.")
+
+        inputs = self.build_inputs(sample, tiled=tiled)
+        input_latents = inputs["input_latents"]
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+
+        first_frame_latents = inputs["first_frame_latents"]
+        if first_frame_latents is None:
+            first_frame_latents = input_latents[:, :, 0:1]
+        batch_size = first_frame_latents.shape[0]
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        timestep_video = torch.zeros(
+            (batch_size,),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+        )
+        video_tokens, _, ttt_loss = self._apply_video_ttt_observation(
+            video_pre["tokens"],
+            state=None,
+            persist_state=False,
+            update=True,
+        )
+        video_pre = dict(video_pre)
+        video_pre["tokens"] = video_tokens
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=action_pre["tokens"].shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
+        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device,
+            dtype=action_loss_per_sample.dtype,
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+
+        loss_total = self.loss_lambda_action * loss_action
+        if ttt_loss is not None and self.loss_lambda_video_ttt != 0.0:
+            loss_total = loss_total + self.loss_lambda_video_ttt * ttt_loss
+
+        loss_dict = {
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_video_ttt": 0.0 if ttt_loss is None else float(ttt_loss.detach().item()),
+        }
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
+        return loss_total, loss_dict
+
     def training_loss(self, sample, tiled: bool = False):
+        if self.video_ttt_observation_training:
+            return self.training_loss_video_ttt_observation(sample, tiled=tiled)
+
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -1003,6 +1181,15 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
         )
+        video_tokens, _, _ = self._apply_video_ttt_observation(
+            video_pre["tokens"],
+            state=self._video_ttt_inference_state,
+            persist_state=True,
+            update=True,
+        )
+        if video_tokens is not video_pre["tokens"]:
+            video_pre = dict(video_pre)
+            video_pre["tokens"] = video_tokens
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,

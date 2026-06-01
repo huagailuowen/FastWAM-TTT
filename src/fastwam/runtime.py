@@ -86,6 +86,7 @@ def create_fastwam(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    video_ttt=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -133,6 +134,13 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(video_ttt, DictConfig):
+        video_ttt = OmegaConf.to_container(video_ttt, resolve=True)
+    if video_ttt is None:
+        video_ttt = {}
+    if not isinstance(video_ttt, dict):
+        raise ValueError(f"`video_ttt` must be dict-like, got {type(video_ttt)}")
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -155,6 +163,9 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_video_ttt=float(loss.get("lambda_video_ttt", 0.0)),
+        video_ttt_config=video_ttt,
+        video_ttt_observation_training=bool(video_ttt.get("observation_training", False)),
     )
 
 

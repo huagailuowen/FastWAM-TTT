@@ -26,6 +26,10 @@ EVALUATION:
   binarize_gripper: true
   use_action_ensembler: false
   visualize_future_video: false
+  warmup_passes: 0
+  warmup_policy: scripted
+  warmup_update_interval: ${.replan_steps}
+  warmup_max_steps: null
 
   # Action inference
   action_horizon: null

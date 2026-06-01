@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -41,6 +42,7 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        self.keep_last_checkpoints = int(cfg.get("keep_last_checkpoints", 0) or 0)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -62,10 +64,14 @@ class Wan22Trainer:
             step_scheduler_with_optimizer=False,
         )
         
+        ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        ds_config = getattr(ds_plugin, "deepspeed_config", {}) or {}
+        zero_stage = ds_config.get("zero_optimization", {}).get("stage", "none")
+
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            zero_stage,
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -82,10 +88,12 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        trainable_params = [param for param in self.model.dit.parameters() if param.requires_grad]
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(param for param in proprio_encoder.parameters() if param.requires_grad)
+        if not trainable_params:
+            raise ValueError("No trainable parameters found after applying train-mode policy.")
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -288,9 +296,20 @@ class Wan22Trainer:
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
-        model.dit.requires_grad_(True)
+        video_ttt_enabled = bool(getattr(model, "video_ttt_enabled", False))
+        video_ttt_train_backbone = bool(getattr(model, "video_ttt_train_backbone", True))
+        if video_ttt_enabled and not video_ttt_train_backbone:
+            model.dit.requires_grad_(False)
+            video_ttt_adapter = getattr(model.dit, "video_ttt_adapter", None)
+            if video_ttt_adapter is None:
+                raise ValueError("`model.video_ttt_train_backbone=false` requires `model.dit.video_ttt_adapter`.")
+            video_ttt_adapter.train()
+            video_ttt_adapter.requires_grad_(True)
+        else:
+            model.dit.requires_grad_(True)
+        train_proprio = not (video_ttt_enabled and not video_ttt_train_backbone)
         proprio_encoder = getattr(model, "proprio_encoder", None)
-        if proprio_encoder is not None:
+        if proprio_encoder is not None and train_proprio:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
 
@@ -594,9 +613,39 @@ class Wan22Trainer:
         self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            self._prune_old_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _prune_old_checkpoints(self):
+        if self.keep_last_checkpoints <= 0:
+            return
+
+        step_pattern = re.compile(r"^step_(\d{6})$")
+        entries: dict[int, dict[str, Path]] = {}
+
+        weights_root = Path(self.weights_dir)
+        if weights_root.is_dir():
+            for path in weights_root.glob("step_*.pt"):
+                match = step_pattern.match(path.stem)
+                if match:
+                    entries.setdefault(int(match.group(1)), {})["weights"] = path
+
+        state_root = Path(self.state_dir)
+        if state_root.is_dir():
+            for path in state_root.glob("step_*"):
+                match = step_pattern.match(path.name)
+                if match:
+                    entries.setdefault(int(match.group(1)), {})["state"] = path
+
+        stale_steps = sorted(entries)[:-self.keep_last_checkpoints]
+        for step in stale_steps:
+            for path in entries[step].values():
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)

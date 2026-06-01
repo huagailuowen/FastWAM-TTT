@@ -306,6 +306,8 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        if hasattr(self.model, "reset_video_ttt_state"):
+            self.model.reset_video_ttt_state()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()

@@ -9,6 +9,17 @@ runs
 runs/
 evaluate_results/
 .deepspeed*
+.hf_cache/
+huggingface/
+wandb/
+*.ckpt
+*.pth
+*.safetensors
+*.mp4
+*.npz
+*.npy
+*.h5
+*.hdf5
 
 
 # ai coding
