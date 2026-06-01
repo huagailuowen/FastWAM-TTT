@@ -305,6 +305,12 @@ class Wan22Trainer:
                 raise ValueError("`model.video_ttt_train_backbone=false` requires `model.dit.video_ttt_adapter`.")
             video_ttt_adapter.train()
             video_ttt_adapter.requires_grad_(True)
+            gate_override = getattr(model, "video_ttt_residual_gate_override", None)
+            if gate_override is not None:
+                with torch.no_grad():
+                    video_ttt_adapter.residual_gate.fill_(float(gate_override))
+            if not bool(getattr(model, "video_ttt_train_residual_gate", True)):
+                video_ttt_adapter.residual_gate.requires_grad_(False)
         else:
             model.dit.requires_grad_(True)
         train_proprio = not (video_ttt_enabled and not video_ttt_train_backbone)

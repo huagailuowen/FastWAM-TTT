@@ -1,0 +1,47 @@
+# @package _global_
+
+defaults:
+  - override /data: ttt_dynamic_carrier_observe20_2cam
+  - override /model: fastwam
+  - _self_
+
+batch_size: 4
+num_workers: 8
+gradient_accumulation_steps: 1
+
+model:
+  mot_checkpoint_mixed_attn: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+  video_ttt:
+    enabled: true
+    observation_training: true
+    train_backbone: false
+    train_residual_gate: false
+    num_tries: 1
+    switch_chunks: false
+    mini_batch_size: 64
+    ttt_lr: 0.5
+    residual_gate_init: 0.02
+    residual_gate_override: 0.02
+  loss:
+    lambda_video: 1.0
+    lambda_action: 1.0
+    lambda_video_ttt: 0.0
+
+lr_scheduler_type: "cosine"
+learning_rate: 2.0e-4
+num_epochs: 1
+max_steps: 30000
+log_every: 5
+save_every: 1000
+keep_last_checkpoints: 2
+eval_every: 0
+eval_num_inference_steps: 10
+
+weight_decay: 1.0e-2
+resume: ./runs/ttt_dynamic_carrier_cream_2cam224_ft/20260531_0527_plain_gpu/checkpoints/weights/step_010000.pt
+
+wandb:
+  enabled: false
+  name: ttt_dynamic_carrier_observe20_2cam224_video_ttt

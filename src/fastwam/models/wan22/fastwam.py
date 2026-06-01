@@ -94,6 +94,13 @@ class FastWAM(torch.nn.Module):
 
         video_ttt_config = {} if video_ttt_config is None else dict(video_ttt_config)
         self.video_ttt_train_backbone = bool(video_ttt_config.get("train_backbone", False))
+        self.video_ttt_train_residual_gate = bool(video_ttt_config.get("train_residual_gate", True))
+        self.video_ttt_num_tries = max(int(video_ttt_config.get("num_tries", 1)), 1)
+        self.video_ttt_switch_chunks = bool(video_ttt_config.get("switch_chunks", False))
+        residual_gate_override = video_ttt_config.get("residual_gate_override", None)
+        self.video_ttt_residual_gate_override = (
+            None if residual_gate_override is None else float(residual_gate_override)
+        )
         if bool(video_ttt_config.get("enabled", False)):
             video_ttt_adapter = VideoTTTQKVAdapter(
                 hidden_dim=int(self.video_expert.hidden_dim),
@@ -101,6 +108,7 @@ class FastWAM(torch.nn.Module):
                 mini_batch_size=int(video_ttt_config.get("mini_batch_size", 64)),
                 ttt_lr=float(video_ttt_config.get("ttt_lr", 0.1)),
                 init_std=float(video_ttt_config.get("init_std", 0.02)),
+                residual_gate_init=float(video_ttt_config.get("residual_gate_init", 0.0)),
             ).to(dtype=torch_dtype)
             self.mot.add_module("video_ttt_adapter", video_ttt_adapter)
 
@@ -236,12 +244,18 @@ class FastWAM(torch.nn.Module):
         state: Optional[dict[str, torch.Tensor]],
         persist_state: bool,
         update: bool = True,
+        update_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
         adapter = self._get_video_ttt_adapter()
         if adapter is None:
             return video_tokens, state, None
 
-        adapted_tokens, new_state, ttt_loss = adapter(video_tokens, state=state, update=update)
+        adapted_tokens, new_state, ttt_loss = adapter(
+            video_tokens,
+            state=state,
+            update=update,
+            update_tokens=update_tokens,
+        )
         if persist_state:
             self._video_ttt_inference_state = adapter.detach_state(new_state)
         return adapted_tokens, new_state, ttt_loss
@@ -424,6 +438,35 @@ class FastWAM(torch.nn.Module):
             )
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
+        restart_context = sample.get("restart_context", None)
+        restart_context_mask = sample.get("restart_context_mask", None)
+        if restart_context is not None or restart_context_mask is not None:
+            if restart_context is None or restart_context_mask is None:
+                raise ValueError("`restart_context` and `restart_context_mask` must be provided together.")
+            if restart_context.ndim != 3 or restart_context_mask.ndim != 2:
+                raise ValueError(
+                    "`restart_context/restart_context_mask` must be [B,L,D]/[B,L], "
+                    f"got {tuple(restart_context.shape)} and {tuple(restart_context_mask.shape)}"
+                )
+            if restart_context.shape[0] != batch_size or restart_context_mask.shape[0] != batch_size:
+                raise ValueError(
+                    "`restart_context` batch size must match video batch size, "
+                    f"got {restart_context.shape[0]} and {batch_size}."
+                )
+            restart_context = restart_context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            restart_context_mask = restart_context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            if self.proprio_encoder is not None:
+                zero_proprio = torch.zeros(
+                    (batch_size, self.proprio_dim),
+                    device=self.device,
+                    dtype=self.torch_dtype,
+                )
+                restart_context, restart_context_mask = self._append_proprio_to_context(
+                    context=restart_context,
+                    context_mask=restart_context_mask,
+                    proprio=zero_proprio,
+                )
+
         if action_is_pad is not None:
             action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if image_is_pad is not None:
@@ -438,6 +481,10 @@ class FastWAM(torch.nn.Module):
             "action": action,
             "action_is_pad": action_is_pad,
             "image_is_pad": image_is_pad,
+            "restart_context": restart_context,
+            "restart_context_mask": restart_context_mask,
+            "video_height": height,
+            "video_width": width,
         }
 
     @torch.no_grad()
@@ -503,27 +550,56 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
-    def training_loss_video_ttt_observation(self, sample, tiled: bool = False):
-        """Inference-matched first-version TTT training.
+    def _build_video_ttt_observation_tokens(
+        self,
+        *,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+    ) -> torch.Tensor:
+        timestep_video_obs = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        obs_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video_obs,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        return obs_pre["tokens"]
 
-        This path updates the video TTT fast weights from the observed frame only,
-        then trains action denoising through the same video-cache action path used
-        by `infer_action`. It intentionally does not predict future video.
-        """
-        if not self.video_ttt_enabled:
-            raise ValueError("`training_loss_video_ttt_observation` requires `model.video_ttt.enabled=true`.")
-
-        inputs = self.build_inputs(sample, tiled=tiled)
+    def _training_loss_video_ttt_one_chunk(
+        self,
+        inputs: dict[str, Any],
+        *,
+        state: Optional[dict[str, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[dict[str, torch.Tensor]]]:
         input_latents = inputs["input_latents"]
+        batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
-
+        image_is_pad = inputs["image_is_pad"]
         first_frame_latents = inputs["first_frame_latents"]
         if first_frame_latents is None:
             first_frame_latents = input_latents[:, :, 0:1]
-        batch_size = first_frame_latents.shape[0]
+
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=input_latents.dtype,
+        )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        if inputs["first_frame_latents"] is not None:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -534,24 +610,26 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        timestep_video = torch.zeros(
-            (batch_size,),
-            dtype=first_frame_latents.dtype,
-            device=self.device,
+        observation_tokens = self._build_video_ttt_observation_tokens(
+            first_frame_latents=first_frame_latents,
+            context=context,
+            context_mask=context_mask,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
         video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
+            x=latents,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
-            action=None,
+            action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
-        video_tokens, _, ttt_loss = self._apply_video_ttt_observation(
+        video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
             video_pre["tokens"],
-            state=None,
+            state=state,
             persist_state=False,
             update=True,
+            update_tokens=observation_tokens,
         )
         video_pre = dict(video_pre)
         video_pre["tokens"] = video_tokens
@@ -563,36 +641,58 @@ class FastWAM(torch.nn.Module):
             context_mask=context_mask,
         )
 
-        video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_seq_len,
+            video_seq_len=video_tokens.shape[1],
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_pre["tokens"].device,
+            device=video_tokens.device,
         )
-        video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
+        tokens_out = self.mot(
+            embeds_all={
+                "video": video_tokens,
+                "action": action_pre["tokens"],
             },
-            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
-        )
-        action_tokens = self.mot.forward_action_with_video_cache(
-            action_tokens=action_pre["tokens"],
-            action_freqs=action_pre["freqs"],
-            action_t_mod=action_pre["t_mod"],
-            action_context_payload={
-                "context": action_pre["context"],
-                "mask": action_pre["context_mask"],
-            },
-            video_kv_cache=video_kv_cache,
             attention_mask=attention_mask,
-            video_seq_len=video_seq_len,
+            freqs_all={
+                "video": video_pre["freqs"],
+                "action": action_pre["freqs"],
+            },
+            context_all={
+                "video": {
+                    "context": video_pre["context"],
+                    "mask": video_pre["context_mask"],
+                },
+                "action": {
+                    "context": action_pre["context"],
+                    "mask": action_pre["context_mask"],
+                },
+            },
+            t_mod_all={
+                "video": video_pre["t_mod"],
+                "action": action_pre["t_mod"],
+            },
         )
-        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
+
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+
+        target_video_for_loss = target_video
+        include_initial_video_step = inputs["first_frame_latents"] is None
+        if inputs["first_frame_latents"] is not None:
+            pred_video = pred_video[:, :, 1:]
+            target_video_for_loss = target_video_for_loss[:, :, 1:]
+
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video,
+            target_video=target_video_for_loss,
+            image_is_pad=image_is_pad,
+            include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            loss_video_per_sample.device,
+            dtype=loss_video_per_sample.dtype,
+        )
+        loss_video = (loss_video_per_sample * video_weight).mean()
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:
@@ -607,15 +707,444 @@ class FastWAM(torch.nn.Module):
             dtype=action_loss_per_sample.dtype,
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
+        loss_outer = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+        return loss_outer, loss_video, loss_action, ttt_loss, state
 
-        loss_total = self.loss_lambda_action * loss_action
-        if ttt_loss is not None and self.loss_lambda_video_ttt != 0.0:
-            loss_total = loss_total + self.loss_lambda_video_ttt * ttt_loss
+    def _training_loss_video_ttt_switch_chunk(
+        self,
+        *,
+        state: Optional[dict[str, torch.Tensor]],
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+    ) -> tuple[Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+        switch_tokens = self._build_video_ttt_observation_tokens(
+            first_frame_latents=first_frame_latents,
+            context=context,
+            context_mask=context_mask,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        _, state, ttt_switch_loss = self._apply_video_ttt_observation(
+            switch_tokens,
+            state=state,
+            persist_state=False,
+            update=True,
+            update_tokens=switch_tokens,
+        )
+        return state, ttt_switch_loss
+
+    @staticmethod
+    def _slice_ttt_try_sample(sample: dict[str, Any], try_idx: int) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        try_keys = {
+            "video",
+            "action",
+            "proprio",
+            "context",
+            "context_mask",
+            "image_is_pad",
+            "action_is_pad",
+            "proprio_is_pad",
+        }
+        for key, value in sample.items():
+            if key in try_keys and isinstance(value, torch.Tensor) and value.ndim >= 2:
+                sliced[key] = value[:, try_idx]
+            elif key in {"restart_context", "restart_context_mask"}:
+                sliced[key] = value
+        return sliced
+
+    def training_loss_video_ttt_repeat_attempt(self, sample: dict[str, Any], tiled: bool = False):
+        video = sample["video"]
+        if video.ndim != 6:
+            raise ValueError(f"repeat-attempt TTT expects video [B,R,3,T,H,W], got {tuple(video.shape)}.")
+        num_tries = int(video.shape[1])
+        use_switch_chunks = bool(self.video_ttt_switch_chunks and num_tries > 1)
+
+        state = None
+        loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_video_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_action_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_switch_loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_loss_count = 0
+        ttt_switch_count = 0
+        black_first_frame_latents = None
+
+        for try_idx in range(num_tries):
+            sub_sample = self._slice_ttt_try_sample(sample, try_idx)
+            inputs = self.build_inputs(sub_sample, tiled=tiled)
+            if try_idx > 0 and use_switch_chunks:
+                restart_context = inputs["restart_context"]
+                restart_context_mask = inputs["restart_context_mask"]
+                if restart_context is None or restart_context_mask is None:
+                    raise ValueError("repeat-attempt TTT switch chunks require `restart_context`.")
+                if black_first_frame_latents is None:
+                    black_video = torch.full(
+                        (
+                            inputs["input_latents"].shape[0],
+                            3,
+                            1,
+                            int(inputs["video_height"]),
+                            int(inputs["video_width"]),
+                        ),
+                        -1.0,
+                        device=self.device,
+                        dtype=self.torch_dtype,
+                    )
+                    black_first_frame_latents = self._encode_video_latents(black_video, tiled=tiled)
+                state, ttt_switch_loss = self._training_loss_video_ttt_switch_chunk(
+                    state=state,
+                    first_frame_latents=black_first_frame_latents,
+                    context=restart_context,
+                    context_mask=restart_context_mask,
+                    fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                )
+                if ttt_switch_loss is not None:
+                    ttt_switch_loss_total = ttt_switch_loss_total + ttt_switch_loss
+                    ttt_loss_total = ttt_loss_total + ttt_switch_loss
+                    ttt_switch_count += 1
+                    ttt_loss_count += 1
+
+            loss_outer, loss_video, loss_action, ttt_loss, state = self._training_loss_video_ttt_one_chunk(
+                inputs,
+                state=state,
+            )
+            loss_total = loss_total + loss_outer
+            loss_video_total = loss_video_total + loss_video
+            loss_action_total = loss_action_total + loss_action
+            if ttt_loss is not None:
+                ttt_loss_total = ttt_loss_total + ttt_loss
+                ttt_loss_count += 1
+
+        loss_video_avg = loss_video_total / float(num_tries)
+        loss_action_avg = loss_action_total / float(num_tries)
+        loss_total = loss_total / float(num_tries)
+        loss_video_ttt = ttt_loss_total / float(max(ttt_loss_count, 1))
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_total = loss_total + self.loss_lambda_video_ttt * loss_video_ttt
 
         loss_dict = {
-            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
-            "loss_video_ttt": 0.0 if ttt_loss is None else float(ttt_loss.detach().item()),
+            "loss_video": self.loss_lambda_video * float(loss_video_avg.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action_avg.detach().item()),
+            "loss_video_ttt": float(loss_video_ttt.detach().item()),
+            "video_ttt_num_tries": float(num_tries),
+            "video_ttt_switch_chunks": float(1 if use_switch_chunks else 0),
         }
+        if ttt_switch_count > 0:
+            loss_dict["loss_video_ttt_switch"] = float(
+                (ttt_switch_loss_total / float(ttt_switch_count)).detach().item()
+            )
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
+        return loss_total, loss_dict
+
+    def training_loss_video_ttt_observe_then_act(self, sample: dict[str, Any], tiled: bool = False):
+        if "ttt_warmup_video" not in sample or "ttt_warmup_proprio" not in sample:
+            raise ValueError("observe-then-act TTT requires `ttt_warmup_video` and `ttt_warmup_proprio`.")
+
+        warmup_video = sample["ttt_warmup_video"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        warmup_proprio = sample["ttt_warmup_proprio"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        if warmup_video.ndim != 5:
+            raise ValueError(f"`ttt_warmup_video` must be [B,N,3,H,W], got {tuple(warmup_video.shape)}.")
+        if warmup_video.shape[2] != 3:
+            raise ValueError(f"`ttt_warmup_video` channel dim must be 3, got {warmup_video.shape[2]}.")
+
+        context = sample["context"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        context_mask = sample["context_mask"].to(device=self.device, dtype=torch.bool, non_blocking=True)
+        state = None
+        ttt_loss_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
+        ttt_loss_count = 0
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        for chunk_idx in range(int(warmup_video.shape[1])):
+            frame = warmup_video[:, chunk_idx].unsqueeze(2)
+            first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
+            obs_context = context
+            obs_context_mask = context_mask
+            if self.proprio_encoder is not None:
+                obs_context, obs_context_mask = self._append_proprio_to_context(
+                    context=obs_context,
+                    context_mask=obs_context_mask,
+                    proprio=warmup_proprio[:, chunk_idx],
+                )
+            state, ttt_loss = self._training_loss_video_ttt_switch_chunk(
+                state=state,
+                first_frame_latents=first_frame_latents,
+                context=obs_context,
+                context_mask=obs_context_mask,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+            if ttt_loss is not None:
+                ttt_loss_total = ttt_loss_total + ttt_loss
+                ttt_loss_count += 1
+
+        inputs = self.build_inputs(sample, tiled=tiled)
+        loss_outer, loss_video, loss_action, ttt_loss, state = self._training_loss_video_ttt_one_chunk(
+            inputs,
+            state=state,
+        )
+        if ttt_loss is not None:
+            ttt_loss_total = ttt_loss_total + ttt_loss
+            ttt_loss_count += 1
+        loss_video_ttt = ttt_loss_total / float(max(ttt_loss_count, 1))
+        loss_total = loss_outer
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_total = loss_total + self.loss_lambda_video_ttt * loss_video_ttt
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_video_ttt": float(loss_video_ttt.detach().item()),
+            "video_ttt_observe_chunks": float(warmup_video.shape[1]),
+            "video_ttt_switch_chunks": 0.0,
+        }
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
+        return loss_total, loss_dict
+
+    def training_loss_video_ttt_observation(self, sample, tiled: bool = False):
+        """TTT training with repeated same-episode inner loops.
+
+        Each outer batch item is treated as one environment instance. The same
+        episode/window is replayed `video_ttt_num_tries` times with a persistent
+        fast state. For every try, the current fast state is used for the action
+        and future-video prediction, then the observation tokens produce the
+        inner update used by the next chunk/try.
+        """
+        if not self.video_ttt_enabled:
+            raise ValueError("`training_loss_video_ttt_observation` requires `model.video_ttt.enabled=true`.")
+        if isinstance(sample.get("video"), torch.Tensor) and sample["video"].ndim == 6:
+            return self.training_loss_video_ttt_repeat_attempt(sample, tiled=tiled)
+        if "ttt_warmup_video" in sample:
+            return self.training_loss_video_ttt_observe_then_act(sample, tiled=tiled)
+
+        inputs = self.build_inputs(sample, tiled=tiled)
+        input_latents = inputs["input_latents"]
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        image_is_pad = inputs["image_is_pad"]
+
+        first_frame_latents = inputs["first_frame_latents"]
+        if first_frame_latents is None:
+            first_frame_latents = input_latents[:, :, 0:1]
+        batch_size = first_frame_latents.shape[0]
+
+        num_tries = max(int(self.video_ttt_num_tries), 1)
+        use_switch_chunks = bool(self.video_ttt_switch_chunks and num_tries > 1)
+        restart_context = inputs["restart_context"]
+        restart_context_mask = inputs["restart_context_mask"]
+        if use_switch_chunks and (restart_context is None or restart_context_mask is None):
+            raise ValueError(
+                "`model.video_ttt.switch_chunks=true` requires dataset `restart_instruction` "
+                "so restart_context/restart_context_mask are available."
+            )
+
+        black_first_frame_latents = None
+        if use_switch_chunks:
+            black_video = torch.full(
+                (
+                    batch_size,
+                    3,
+                    1,
+                    int(inputs["video_height"]),
+                    int(inputs["video_width"]),
+                ),
+                -1.0,
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
+            black_first_frame_latents = self._encode_video_latents(black_video, tiled=tiled)
+
+        def build_observation_tokens(
+            obs_latents: torch.Tensor,
+            obs_context: torch.Tensor,
+            obs_context_mask: torch.Tensor,
+        ) -> torch.Tensor:
+            timestep_video_obs = torch.zeros(
+                (batch_size,),
+                dtype=obs_latents.dtype,
+                device=self.device,
+            )
+            obs_pre = self.video_expert.pre_dit(
+                x=obs_latents,
+                timestep=timestep_video_obs,
+                context=obs_context,
+                context_mask=obs_context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            )
+            return obs_pre["tokens"]
+
+        state = None
+        loss_total = input_latents.new_tensor(0.0, dtype=torch.float32)
+        loss_video_total = input_latents.new_tensor(0.0, dtype=torch.float32)
+        loss_action_total = input_latents.new_tensor(0.0, dtype=torch.float32)
+        ttt_loss_total = input_latents.new_tensor(0.0, dtype=torch.float32)
+        ttt_switch_loss_total = input_latents.new_tensor(0.0, dtype=torch.float32)
+        ttt_loss_count = 0
+        ttt_switch_count = 0
+
+        for try_idx in range(num_tries):
+            if try_idx > 0 and use_switch_chunks:
+                switch_tokens = build_observation_tokens(
+                    black_first_frame_latents,
+                    restart_context,
+                    restart_context_mask,
+                )
+                _, state, ttt_switch_loss = self._apply_video_ttt_observation(
+                    switch_tokens,
+                    state=state,
+                    persist_state=False,
+                    update=True,
+                    update_tokens=switch_tokens,
+                )
+                if ttt_switch_loss is not None:
+                    ttt_switch_loss_total = ttt_switch_loss_total + ttt_switch_loss
+                    ttt_loss_total = ttt_loss_total + ttt_switch_loss
+                    ttt_switch_count += 1
+                    ttt_loss_count += 1
+
+            noise_video = torch.randn_like(input_latents)
+            timestep_video = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+            target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+            if inputs["first_frame_latents"] is not None:
+                latents[:, :, 0:1] = inputs["first_frame_latents"]
+
+            noise_action = torch.randn_like(action)
+            timestep_action = self.train_action_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=action.dtype,
+            )
+            noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+            target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+            observation_tokens = build_observation_tokens(first_frame_latents, context, context_mask)
+            video_pre = self.video_expert.pre_dit(
+                x=latents,
+                timestep=timestep_video,
+                context=context,
+                context_mask=context_mask,
+                action=action,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            )
+            video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
+                video_pre["tokens"],
+                state=state,
+                persist_state=False,
+                update=True,
+                update_tokens=observation_tokens,
+            )
+            if ttt_loss is not None:
+                ttt_loss_total = ttt_loss_total + ttt_loss
+                ttt_loss_count += 1
+            video_pre = dict(video_pre)
+            video_pre["tokens"] = video_tokens
+
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=timestep_action,
+                context=context,
+                context_mask=context_mask,
+            )
+
+            video_tokens = video_pre["tokens"]
+            action_tokens = action_pre["tokens"]
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_tokens.shape[1],
+                action_seq_len=action_tokens.shape[1],
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                device=video_tokens.device,
+            )
+            tokens_out = self.mot(
+                embeds_all={
+                    "video": video_tokens,
+                    "action": action_tokens,
+                },
+                attention_mask=attention_mask,
+                freqs_all={
+                    "video": video_pre["freqs"],
+                    "action": action_pre["freqs"],
+                },
+                context_all={
+                    "video": {
+                        "context": video_pre["context"],
+                        "mask": video_pre["context_mask"],
+                    },
+                    "action": {
+                        "context": action_pre["context"],
+                        "mask": action_pre["context_mask"],
+                    },
+                },
+                t_mod_all={
+                    "video": video_pre["t_mod"],
+                    "action": action_pre["t_mod"],
+                },
+            )
+
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+            pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+
+            target_video_for_loss = target_video
+            include_initial_video_step = inputs["first_frame_latents"] is None
+            if inputs["first_frame_latents"] is not None:
+                pred_video = pred_video[:, :, 1:]
+                target_video_for_loss = target_video_for_loss[:, :, 1:]
+
+            loss_video_per_sample = self._compute_video_loss_per_sample(
+                pred_video=pred_video,
+                target_video=target_video_for_loss,
+                image_is_pad=image_is_pad,
+                include_initial_video_step=include_initial_video_step,
+            )
+            video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_video_per_sample.device,
+                dtype=loss_video_per_sample.dtype,
+            )
+            loss_video = (loss_video_per_sample * video_weight).mean()
+
+            action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
+            if action_is_pad is not None:
+                valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+                valid_sum = valid.sum(dim=1).clamp(min=1.0)
+                action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
+            else:
+                action_loss_per_sample = action_loss_token.mean(dim=1)
+
+            action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+                action_loss_per_sample.device,
+                dtype=action_loss_per_sample.dtype,
+            )
+            loss_action = (action_loss_per_sample * action_weight).mean()
+
+            loss_video_total = loss_video_total + loss_video
+            loss_action_total = loss_action_total + loss_action
+            loss_total = loss_total + self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
+
+        loss_video_avg = loss_video_total / float(num_tries)
+        loss_action_avg = loss_action_total / float(num_tries)
+        loss_total = loss_total / float(num_tries)
+        loss_video_ttt = ttt_loss_total / float(max(ttt_loss_count, 1))
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_total = loss_total + self.loss_lambda_video_ttt * loss_video_ttt
+
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video_avg.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action_avg.detach().item()),
+            "loss_video_ttt": float(loss_video_ttt.detach().item()),
+            "video_ttt_num_tries": float(num_tries),
+            "video_ttt_switch_chunks": float(1 if use_switch_chunks else 0),
+        }
+        if ttt_switch_count > 0:
+            loss_video_ttt_switch = ttt_switch_loss_total / float(ttt_switch_count)
+            loss_dict["loss_video_ttt_switch"] = float(loss_video_ttt_switch.detach().item())
         if self.loss_lambda_video_ttt != 0.0:
             loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
         return loss_total, loss_dict

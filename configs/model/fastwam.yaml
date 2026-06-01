@@ -55,6 +55,7 @@ action_scheduler:
   num_train_timesteps: 1000
 
 loss:
+  lambda_video: 1.0
   lambda_action: 1.0
   lambda_video_ttt: 0.0
 
@@ -62,6 +63,11 @@ video_ttt:
   enabled: false
   observation_training: false
   train_backbone: false
+  train_residual_gate: true
+  num_tries: 1
+  switch_chunks: false
   mini_batch_size: 64
   ttt_lr: 0.1
   init_std: 0.02
+  residual_gate_init: 0.0
+  residual_gate_override: null

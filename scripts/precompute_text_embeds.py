@@ -71,6 +71,8 @@ def _collect_dataset_settings(data_cfg: DictConfig):
     dataset_dirs: list[str] = []
     cache_dirs: list[Path] = []
     context_lens = set()
+    extra_prompts: list[str] = []
+    seen_extra_prompts = set()
 
     for node_path, node in _iter_dataset_nodes(data_cfg, path="data"):
         raw_dirs = node.get("dataset_dirs")
@@ -97,9 +99,16 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
+        restart_instruction = node.get("restart_instruction")
+        if restart_instruction is not None and str(restart_instruction).strip():
+            restart_prompt = DEFAULT_PROMPT.format(task=str(restart_instruction).strip())
+            if restart_prompt not in seen_extra_prompts:
+                seen_extra_prompts.add(restart_prompt)
+                extra_prompts.append(restart_prompt)
+
         logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
 
-    return dataset_dirs, cache_dirs, context_lens
+    return dataset_dirs, cache_dirs, context_lens, extra_prompts
 
 
 def _resolve_context_len(context_lens: set[int]) -> int:
@@ -187,7 +196,7 @@ def main(cfg: DictConfig):
     if cfg.data is None:
         raise ValueError("`cfg.data` is required.")
 
-    dataset_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
+    dataset_dirs, cache_dirs, context_lens, extra_prompts = _collect_dataset_settings(cfg.data)
     if not cache_dirs:
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
@@ -200,6 +209,9 @@ def main(cfg: DictConfig):
         if not dataset_dirs:
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
         prompts = _read_unique_prompts(dataset_dirs)
+        for prompt in extra_prompts:
+            if prompt not in prompts:
+                prompts.append(prompt)
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return

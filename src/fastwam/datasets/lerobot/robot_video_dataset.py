@@ -1,5 +1,7 @@
 import hashlib
+import json
 import os
+from pathlib import Path
 from typing import Optional
 import time
 import numpy as np
@@ -42,6 +44,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        restart_instruction: Optional[str] = None,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +75,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.restart_instruction = restart_instruction
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -231,6 +235,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.restart_instruction is not None:
+            restart_instruction = DEFAULT_PROMPT.format(task=str(self.restart_instruction))
+            restart_context, restart_context_mask = self._get_cached_text_context(restart_instruction)
+            restart_context[~restart_context_mask] = 0.0
+            restart_context_mask = torch.ones_like(restart_context_mask)
+            data.update(
+                {
+                    "restart_prompt": restart_instruction,
+                    "restart_context": restart_context,
+                    "restart_context_mask": restart_context_mask,
+                }
+            )
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -277,3 +293,192 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+
+class RobotVideoTTTGroupedDataset(RobotVideoDataset):
+    """LeRobot dynamic-carrier dataset with explicit TTT episode structure.
+
+    repeat_attempt mode returns a same-environment group as tensors with an
+    extra try dimension: video=[tries, 3, T, H, W].
+    observe_then_act mode returns one execution window plus warmup observation
+    frames sampled before execution: ttt_warmup_video=[chunks, 3, H, W].
+    """
+
+    def __init__(
+        self,
+        *args,
+        ttt_metadata_path: Optional[str] = None,
+        ttt_mode: Optional[str] = None,
+        tries_per_group: int = 6,
+        observe_chunks: int = 20,
+        chunk_interval: int = 10,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if ttt_metadata_path is None:
+            dataset_dirs = kwargs.get("dataset_dirs")
+            if dataset_dirs is None and len(args) >= 1:
+                dataset_dirs = args[0]
+            if not dataset_dirs:
+                raise ValueError("`ttt_metadata_path` is required when dataset_dirs is empty.")
+            ttt_metadata_path = str(Path(str(dataset_dirs[0])) / "dynamic_carrier_generation_metadata.json")
+        self.ttt_metadata_path = Path(ttt_metadata_path)
+        self.ttt_metadata = json.loads(self.ttt_metadata_path.read_text(encoding="utf-8"))
+        self.ttt_mode = str(ttt_mode or self.ttt_metadata.get("ttt_mode", "")).strip()
+        if self.ttt_mode not in {"repeat_attempt", "observe_then_act"}:
+            raise ValueError(
+                f"`ttt_mode` must be repeat_attempt or observe_then_act, got {self.ttt_mode!r}."
+            )
+        self.tries_per_group = int(tries_per_group)
+        self.observe_chunks = int(observe_chunks)
+        self.chunk_interval = int(chunk_interval)
+        if self.tries_per_group <= 0:
+            raise ValueError("`tries_per_group` must be positive.")
+        if self.observe_chunks <= 0:
+            raise ValueError("`observe_chunks` must be positive.")
+        if self.chunk_interval <= 0:
+            raise ValueError("`chunk_interval` must be positive.")
+        self.ttt_entries = self._build_ttt_entries()
+
+    def _episode_bounds(self, episode_index: int) -> tuple[int, int]:
+        starts = self.lerobot_dataset.episode_data_index["from"]
+        ends = self.lerobot_dataset.episode_data_index["to"]
+        if episode_index < 0 or episode_index >= len(starts):
+            raise IndexError(f"Episode index {episode_index} out of bounds for {len(starts)} episodes.")
+        return int(starts[episode_index].item()), int(ends[episode_index].item())
+
+    def _max_valid_start(self, episode_indices: list[int]) -> int:
+        stride = int(self.lerobot_dataset.global_sample_stride)
+        required_tail = (int(self.num_frames) - 1) * stride
+        lengths = []
+        for episode_index in episode_indices:
+            start, end = self._episode_bounds(int(episode_index))
+            lengths.append(max(int(end - start), 1))
+        return max(min(lengths) - 1 - required_tail, 0)
+
+    def _global_index(self, episode_index: int, offset: int) -> int:
+        start, _ = self._episode_bounds(int(episode_index))
+        return int(start + max(int(offset), 0))
+
+    def _build_ttt_entries(self) -> list[dict]:
+        groups = list(self.ttt_metadata.get("groups") or [])
+        entries: list[dict] = []
+        if self.ttt_mode == "repeat_attempt":
+            for group in groups:
+                episode_indices = [int(x) for x in group.get("episode_indices", [])[: self.tries_per_group]]
+                if len(episode_indices) < self.tries_per_group:
+                    continue
+                max_start = self._max_valid_start(episode_indices)
+                offsets = list(range(0, max_start + 1, self.chunk_interval)) or [0]
+                for offset in offsets:
+                    entries.append(
+                        {
+                            "mode": "repeat_attempt",
+                            "group_id": int(group.get("group_id", len(entries))),
+                            "episode_indices": episode_indices,
+                            "offset": int(offset),
+                        }
+                    )
+        else:
+            if not groups:
+                groups = [
+                    {
+                        "group_id": idx,
+                        "episode_indices": [int(item["episode_index"])],
+                        "observe_frames": int(item.get("observe_frames", 0)),
+                    }
+                    for idx, item in enumerate(self.ttt_metadata.get("successes", []))
+                    if item.get("episode_index") is not None
+                ]
+            default_observe_frames = int(self.observe_chunks * self.chunk_interval)
+            for group in groups:
+                episode_indices = [int(x) for x in group.get("episode_indices", [])]
+                if not episode_indices:
+                    continue
+                episode_index = episode_indices[0]
+                observe_frames = int(group.get("observe_frames", default_observe_frames))
+                max_start = self._max_valid_start([episode_index])
+                start = min(max(observe_frames, 0), max_start)
+                offsets = list(range(start, max_start + 1, self.chunk_interval)) or [start]
+                for offset in offsets:
+                    entries.append(
+                        {
+                            "mode": "observe_then_act",
+                            "group_id": int(group.get("group_id", len(entries))),
+                            "episode_index": int(episode_index),
+                            "offset": int(offset),
+                            "observe_frames": int(observe_frames),
+                        }
+                    )
+        if not entries:
+            raise ValueError(f"No TTT entries could be built from {self.ttt_metadata_path}.")
+        return entries
+
+    def __len__(self):
+        return len(self.ttt_entries)
+
+    @staticmethod
+    def _stack_try_samples(samples: list[dict]) -> dict:
+        tensor_keys = [
+            "video",
+            "action",
+            "proprio",
+            "context",
+            "context_mask",
+            "image_is_pad",
+            "action_is_pad",
+            "proprio_is_pad",
+        ]
+        data = {
+            key: torch.stack([sample[key] for sample in samples], dim=0)
+            for key in tensor_keys
+            if key in samples[0]
+        }
+        data["prompt"] = [sample.get("prompt", "") for sample in samples]
+        if "restart_context" in samples[0]:
+            data["restart_context"] = samples[0]["restart_context"]
+            data["restart_context_mask"] = samples[0]["restart_context_mask"]
+            data["restart_prompt"] = samples[0].get("restart_prompt", "")
+        return data
+
+    def _get_observe_warmup(self, episode_index: int, observe_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
+        frames = []
+        proprios = []
+        max_offset = max(int(observe_frames) - 1, 0)
+        offsets = [min(i * self.chunk_interval, max_offset) for i in range(self.observe_chunks)]
+        for offset in offsets:
+            sample = self._get(self._global_index(episode_index, offset))
+            frames.append(sample["video"][:, 0])
+            proprios.append(sample["proprio"][0])
+        return torch.stack(frames, dim=0), torch.stack(proprios, dim=0)
+
+    def __getitem__(self, idx):
+        try:
+            entry = self.ttt_entries[int(idx)]
+            if entry["mode"] == "repeat_attempt":
+                samples = [
+                    self._get(self._global_index(episode_index, entry["offset"]))
+                    for episode_index in entry["episode_indices"]
+                ]
+                data = self._stack_try_samples(samples)
+                data["ttt_sequence_mode_id"] = torch.tensor(1, dtype=torch.long)
+                data["ttt_group_id"] = torch.tensor(entry["group_id"], dtype=torch.long)
+                data["ttt_chunk_offset"] = torch.tensor(entry["offset"], dtype=torch.long)
+                return data
+
+            data = self._get(self._global_index(entry["episode_index"], entry["offset"]))
+            warmup_video, warmup_proprio = self._get_observe_warmup(
+                entry["episode_index"],
+                entry["observe_frames"],
+            )
+            data["ttt_warmup_video"] = warmup_video
+            data["ttt_warmup_proprio"] = warmup_proprio
+            data["ttt_sequence_mode_id"] = torch.tensor(2, dtype=torch.long)
+            data["ttt_group_id"] = torch.tensor(entry["group_id"], dtype=torch.long)
+            data["ttt_chunk_offset"] = torch.tensor(entry["offset"], dtype=torch.long)
+            return data
+        except Exception as e:
+            print(f"Error processing TTT sample idx {idx}: {e}. Returning a random sample instead.")
+            print(traceback.format_exc())
+            random_idx = np.random.randint(len(self))
+            return self.__getitem__(random_idx)

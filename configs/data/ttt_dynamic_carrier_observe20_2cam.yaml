@@ -1,7 +1,7 @@
 train:
-  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoTTTGroupedDataset
   dataset_dirs:
-    - ./data/ttt_dynamic_carrier_cream_200_lerobot
+    - ./data/ttt_dynamic_carrier_observe20_200_lerobot
   shape_meta:
     images:
       - key: image
@@ -28,6 +28,10 @@ train:
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
   restart_instruction: null
+  ttt_mode: observe_then_act
+  tries_per_group: 1
+  observe_chunks: 20
+  chunk_interval: 10
   pretrained_norm_stats: null
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
@@ -52,5 +56,5 @@ train:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/ttt_dynamic_carrier
+  text_embedding_cache_dir: ./data/text_embeds_cache/ttt_dynamic_carrier_observe20
   context_len: 128

@@ -14,10 +14,12 @@ class VideoTTTQKVAdapter(nn.Module):
     the TTT-QKV pattern:
 
         K = theta_K(x), V = theta_V(x), Q = theta_Q(x)
-        W' = W - lr * grad || f(K; W) - target(V, K) ||^2
-        y = x + gate * f(Q; W')
+        y = x + gate * f(Q; W)
+        W_next = W - lr * grad || f(K; W) - target(V, K) ||^2
 
     `state` carries the fast learner across observation chunks at inference.
+    The inner update is deferred until after the current chunk output is formed,
+    so chunk N predicts with state N and only chunk N+1 observes state N+1.
     """
 
     def __init__(
@@ -28,6 +30,7 @@ class VideoTTTQKVAdapter(nn.Module):
         mini_batch_size: int = 64,
         ttt_lr: float = 0.1,
         init_std: float = 0.02,
+        residual_gate_init: float = 0.0,
     ):
         super().__init__()
         if hidden_dim <= 0:
@@ -48,6 +51,7 @@ class VideoTTTQKVAdapter(nn.Module):
         self.head_dim = self.hidden_dim // self.num_heads
         self.mini_batch_size = int(mini_batch_size)
         self.ttt_lr = float(ttt_lr)
+        self.residual_gate_init = float(residual_gate_init)
 
         self.input_norm = nn.LayerNorm(self.hidden_dim, eps=1e-6)
         self.to_q = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -69,7 +73,7 @@ class VideoTTTQKVAdapter(nn.Module):
         nn.init.zeros_(self.b_init)
         nn.init.ones_(self.ttt_norm_weight)
         nn.init.zeros_(self.ttt_norm_bias)
-        nn.init.zeros_(self.residual_gate)
+        self.residual_gate.data.fill_(self.residual_gate_init)
 
     def init_state(
         self,
@@ -140,6 +144,7 @@ class VideoTTTQKVAdapter(nn.Module):
         *,
         state: Optional[dict[str, torch.Tensor]] = None,
         update: bool = True,
+        update_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         if tokens.ndim != 3:
             raise ValueError(f"`tokens` must be [B, S, D], got shape {tuple(tokens.shape)}.")
@@ -147,6 +152,16 @@ class VideoTTTQKVAdapter(nn.Module):
             raise ValueError(
                 f"`tokens` hidden dim mismatch: expected {self.hidden_dim}, got {tokens.shape[-1]}."
             )
+        if update_tokens is not None:
+            if update_tokens.ndim != 3:
+                raise ValueError(
+                    f"`update_tokens` must be [B, S, D], got shape {tuple(update_tokens.shape)}."
+                )
+            if update_tokens.shape[0] != tokens.shape[0] or update_tokens.shape[-1] != self.hidden_dim:
+                raise ValueError(
+                    "`update_tokens` must share batch and hidden dims with `tokens`, "
+                    f"got {tuple(update_tokens.shape)} vs {tuple(tokens.shape)}."
+                )
 
         if state is None or not self._state_matches(state, tokens):
             state = self.init_state(tokens.shape[0], device=tokens.device, dtype=tokens.dtype)
@@ -154,17 +169,30 @@ class VideoTTTQKVAdapter(nn.Module):
         b = state["b"]
 
         q, k, v = self._project_qkv(tokens)
+        if update_tokens is None:
+            update_k = k
+            update_v = v
+        else:
+            _, update_k, update_v = self._project_qkv(update_tokens)
 
         outputs = []
-        loss_sum = tokens.new_tensor(0.0, dtype=torch.float32)
-        num_chunks = 0
-        lr = self.ttt_lr / max(float(self.head_dim), 1.0)
-
         for start in range(0, tokens.shape[1], self.mini_batch_size):
             end = min(start + self.mini_batch_size, tokens.shape[1])
             q_mb = q[:, :, start:end]
-            k_mb = k[:, :, start:end]
-            v_mb = v[:, :, start:end]
+            out_delta = self._head_layer_norm(torch.matmul(q_mb, W) + b)
+            outputs.append(q_mb + out_delta)
+
+        loss_sum = tokens.new_tensor(0.0, dtype=torch.float32)
+        grad_W_sum: Optional[torch.Tensor] = None
+        grad_b_sum: Optional[torch.Tensor] = None
+        num_chunks = 0
+        num_update_chunks = 0
+        lr = self.ttt_lr / max(float(self.head_dim), 1.0)
+
+        for start in range(0, update_k.shape[2], self.mini_batch_size):
+            end = min(start + self.mini_batch_size, update_k.shape[2])
+            k_mb = update_k[:, :, start:end]
+            v_mb = update_v[:, :, start:end]
 
             target_delta = self._head_layer_norm(v_mb - k_mb)
             pred_delta = torch.matmul(k_mb, W) + b
@@ -176,11 +204,13 @@ class VideoTTTQKVAdapter(nn.Module):
                 scale = 1.0 / max(float(end - start), 1.0)
                 grad_W = torch.matmul(k_mb.transpose(-2, -1), err) * scale
                 grad_b = err.mean(dim=-2, keepdim=True)
-                W = W - lr * grad_W
-                b = b - lr * grad_b
+                grad_W_sum = grad_W if grad_W_sum is None else grad_W_sum + grad_W
+                grad_b_sum = grad_b if grad_b_sum is None else grad_b_sum + grad_b
+                num_update_chunks += 1
 
-            out_delta = self._head_layer_norm(torch.matmul(q_mb, W) + b)
-            outputs.append(q_mb + out_delta)
+        if update and lr > 0 and num_update_chunks > 0:
+            W = W - lr * (grad_W_sum / float(num_update_chunks))
+            b = b - lr * (grad_b_sum / float(num_update_chunks))
 
         out_heads = torch.cat(outputs, dim=2)
         out = out_heads.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[1], self.hidden_dim)
