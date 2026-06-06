@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -209,7 +210,50 @@ def _prompt_for_case(case: DynamicCarrierCase, cfg: DictConfig) -> str:
     return FLAT_PROMPT
 
 
-def _load_eval_cases(cfg: DictConfig) -> list[tuple[DynamicCarrierCase, int, int]]:
+def _planner_config_from_eval_cfg(cfg: DictConfig) -> PlannerConfig:
+    return PlannerConfig(
+        intercept_lead_s=float(cfg.EVALUATION.get("intercept_lead_s", 0.42)),
+        position_gain=float(cfg.EVALUATION.get("position_gain", 10.0)),
+        max_pos_action=float(cfg.EVALUATION.get("max_pos_action", 1.0)),
+        xy_tolerance=float(cfg.EVALUATION.get("xy_tolerance", 0.035)),
+        target_xy_tolerance=float(cfg.EVALUATION.get("target_xy_tolerance", 0.055)),
+        z_tolerance=float(cfg.EVALUATION.get("z_tolerance", 0.035)),
+    )
+
+
+def _get_observe_then_act_interval(cfg: DictConfig) -> int:
+    return int(
+        cfg.EVALUATION.get(
+            "observe_then_act_interval",
+            cfg.data.train.get("chunk_interval", cfg.EVALUATION.get("replan_steps", 10)),
+        )
+    )
+
+
+def _model_has_video_ttt_adapter(model: torch.nn.Module) -> bool:
+    enabled = getattr(model, "video_ttt_enabled", False)
+    if callable(enabled):
+        enabled = enabled()
+    return bool(enabled)
+
+
+def _phase_shift_case(
+    case: DynamicCarrierCase,
+    *,
+    group_index: int,
+    try_index: int,
+    tries_per_group: int,
+) -> DynamicCarrierCase:
+    offset = 2.0 * math.pi * float(try_index) / max(float(tries_per_group), 1.0)
+    motion = replace(case.motion, phase=float((case.motion.phase + offset) % (2.0 * math.pi)))
+    return replace(
+        case,
+        case_id=f"{case.case_id}_evalgroup{group_index:04d}_try{try_index:02d}",
+        motion=motion,
+    )
+
+
+def _load_eval_cases(cfg: DictConfig) -> list[dict[str, Any]]:
     metadata_path = _resolve_path(
         cfg.EVALUATION.get(
             "dynamic_metadata_path",
@@ -217,27 +261,152 @@ def _load_eval_cases(cfg: DictConfig) -> list[tuple[DynamicCarrierCase, int, int
         )
     )
     payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    start = int(cfg.EVALUATION.get("case_start", 0))
+    num_trials = int(cfg.EVALUATION.num_trials)
+    default_repeat = str(payload.get("ttt_mode", "")) == "repeat_attempt"
+    use_groups = bool(cfg.EVALUATION.get("repeat_eval_from_groups", default_repeat))
+
+    if use_groups and payload.get("groups"):
+        groups = list(payload.get("groups") or [])
+        selected = groups[start : start + num_trials]
+        if len(selected) < num_trials:
+            selected.extend(groups[: num_trials - len(selected)])
+        records: list[dict[str, Any]] = []
+        for fallback_idx, group in enumerate(selected):
+            tries = list(group.get("tries") or [])
+            try_cases = [
+                DynamicCarrierCase.from_dict(item["case"])
+                for item in tries
+                if isinstance(item, dict) and item.get("case") is not None
+            ]
+            try_seeds = [
+                int(item.get("seed", int(payload.get("seed", 0)) + fallback_idx + try_idx))
+                for try_idx, item in enumerate(tries)
+                if isinstance(item, dict)
+            ]
+            records.append(
+                {
+                    "case": DynamicCarrierCase.from_dict(group["case"]),
+                    "seed": int(try_seeds[0] if try_seeds else int(payload.get("seed", 0)) + fallback_idx),
+                    "dataset_episode_index": int((group.get("episode_indices") or [start + fallback_idx])[0]),
+                    "group_id": int(group.get("group_id", start + fallback_idx)),
+                    "try_cases": try_cases,
+                    "try_seeds": try_seeds,
+                    "episode_indices": [int(x) for x in group.get("episode_indices", [])],
+                    "repeat_group": True,
+                    "metadata_path": str(metadata_path),
+                }
+            )
+        return records
+
     successes = payload.get("successes", [])
     if not isinstance(successes, list) or len(successes) == 0:
         raise ValueError(f"No successful cases found in {metadata_path}")
-
-    start = int(cfg.EVALUATION.get("case_start", 0))
-    num_trials = int(cfg.EVALUATION.num_trials)
     selected = successes[start : start + num_trials]
     if len(selected) < num_trials:
-        repeats = (num_trials - len(selected))
-        selected.extend(successes[:repeats])
+        selected.extend(successes[: num_trials - len(selected)])
 
-    cases = []
+    records = []
     for fallback_idx, item in enumerate(selected):
-        cases.append(
-            (
-                DynamicCarrierCase.from_dict(item["case"]),
-                int(item.get("seed", payload.get("seed", 0) + fallback_idx)),
-                int(item.get("episode_index", start + fallback_idx)),
-            )
+        records.append(
+            {
+                "case": DynamicCarrierCase.from_dict(item["case"]),
+                "seed": int(item.get("seed", payload.get("seed", 0) + fallback_idx)),
+                "dataset_episode_index": int(item.get("episode_index", start + fallback_idx)),
+                "group_id": int(start + fallback_idx),
+                "try_cases": [],
+                "try_seeds": [],
+                "episode_indices": [],
+                "repeat_group": False,
+                "metadata_path": str(metadata_path),
+            }
         )
-    return cases
+    return records
+
+
+def _case_for_try(record: dict[str, Any], try_idx: int, tries_per_group: int) -> DynamicCarrierCase:
+    try_cases = record.get("try_cases") or []
+    if try_idx < len(try_cases):
+        return try_cases[try_idx]
+    return _phase_shift_case(
+        record["case"],
+        group_index=int(record.get("group_id", 0)),
+        try_index=int(try_idx),
+        tries_per_group=int(tries_per_group),
+    )
+
+
+def _seed_for_try(record: dict[str, Any], try_idx: int) -> int:
+    try_seeds = record.get("try_seeds") or []
+    if try_idx < len(try_seeds):
+        return int(try_seeds[try_idx])
+    return int(record["seed"]) + int(try_idx)
+
+
+def _episode_index_for_try(record: dict[str, Any], try_idx: int) -> int:
+    episode_indices = record.get("episode_indices") or []
+    if try_idx < len(episode_indices):
+        return int(episode_indices[try_idx])
+    return int(record.get("dataset_episode_index", 0))
+
+
+@torch.no_grad()
+def _apply_restart_ttt_marker(
+    *,
+    model: torch.nn.Module,
+    cfg: DictConfig,
+    input_w: int,
+    input_h: int,
+    model_device: str,
+) -> Optional[float]:
+    """Apply the repeat-attempt black-frame switch update used during training."""
+    if not hasattr(model, "_apply_video_ttt_observation"):
+        return None
+    restart_instruction = str(
+        cfg.data.train.get(
+            "restart_instruction",
+            "restart the same dynamic carrier task and try again in the same environment",
+        )
+    )
+    prompt = DEFAULT_PROMPT.format(task=restart_instruction)
+    context, context_mask = model.encode_prompt(prompt)
+    if getattr(model, "proprio_encoder", None) is not None:
+        zero_proprio = torch.zeros(
+            (1, int(model.proprio_dim)),
+            device=model.device,
+            dtype=model.torch_dtype,
+        )
+        context, context_mask = model._append_proprio_to_context(
+            context=context,
+            context_mask=context_mask,
+            proprio=zero_proprio,
+        )
+    black_image = torch.full(
+        (1, 3, int(input_h), int(input_w)),
+        -1.0,
+        device=model_device,
+        dtype=model.torch_dtype,
+    )
+    first_frame_latents = model._encode_input_image_latents_tensor(
+        input_image=black_image,
+        tiled=bool(cfg.EVALUATION.get("tiled", False)),
+    )
+    tokens = model._build_video_ttt_observation_tokens(
+        first_frame_latents=first_frame_latents,
+        context=context,
+        context_mask=context_mask,
+        fuse_vae_embedding_in_latents=bool(getattr(model.video_expert, "fuse_vae_embedding_in_latents", False)),
+    )
+    _, _, ttt_loss = model._apply_video_ttt_observation(
+        tokens,
+        state=model._video_ttt_inference_state,
+        persist_state=True,
+        update=True,
+        update_tokens=tokens,
+    )
+    if ttt_loss is None:
+        return None
+    return float(ttt_loss.detach().float().cpu().item())
 
 
 def _predict_action_chunk(
@@ -359,6 +528,8 @@ def run_episode(
     eef_trace: list[list[float]] = []
     payload_trace: list[list[float]] = []
     carrier_trace: list[list[float]] = []
+    pickup_success = False
+    first_pickup_step: Optional[int] = None
 
     try:
         obs = env.reset(init_state=init_state)
@@ -406,6 +577,9 @@ def run_episode(
             carrier_trace.append(env.carrier_position().astype(float).tolist())
             action_trace.append(action.astype(float).tolist())
             obs, _, done, _ = env.step(action)
+            if env.payload_attached_to_gripper and not pickup_success:
+                pickup_success = True
+                first_pickup_step = len(action_trace)
 
             if visualize_future_video and current_clip is not None:
                 current_replan_step += 1
@@ -439,6 +613,8 @@ def run_episode(
             "seed": int(seed),
             "task_description": task_description,
             "success": bool(success),
+            "pickup_success": bool(pickup_success),
+            "first_pickup_step": int(first_pickup_step) if first_pickup_step is not None else None,
             "steps": int(len(action_trace)),
             "actions": action_trace,
             "eef_xyz": eef_trace,
@@ -448,6 +624,243 @@ def run_episode(
         mean_psnr = float(np.mean(future_clip_psnr)) if len(future_clip_psnr) > 0 else None
         return result, replay_images, predicted_future_video_clips, mean_psnr
     finally:
+        env.close()
+
+
+def run_observe_then_act_episode(
+    *,
+    case: DynamicCarrierCase,
+    seed: int,
+    dataset_episode_index: int,
+    model: torch.nn.Module,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+    trial_idx: int,
+    action_horizon: int,
+    input_w: int,
+    input_h: int,
+    model_device: str,
+    reset_ttt_state: bool = True,
+) -> tuple[dict[str, Any], list[Any], list[dict[str, Any]], Optional[float]]:
+    base_env, init_state, _ = create_libero_env_for_case(
+        case,
+        repo_root=TTT_ROOT,
+        camera_resolution=int(cfg.EVALUATION.get("camera_resolution", 224)),
+        seed=seed,
+    )
+    env = DynamicCarrierEnv(base_env, case)
+    task_description = _prompt_for_case(case, cfg)
+    max_steps = int(cfg.EVALUATION.get("max_steps", case.max_steps))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
+    num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 0))
+    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
+    observe_chunks = int(cfg.EVALUATION.get("observe_then_act_chunks", 0))
+    observe_interval = _get_observe_then_act_interval(cfg)
+    observe_policy = str(cfg.EVALUATION.get("observe_then_act_observe_policy", "dummy"))
+    count_observe_steps = bool(cfg.EVALUATION.get("observe_then_act_count_observe_steps", True))
+    update_during_observe = bool(
+        cfg.EVALUATION.get("observe_then_act_update_during_observe", True)
+    ) and _model_has_video_ttt_adapter(model)
+
+    if observe_chunks <= 0:
+        raise ValueError(f"EVALUATION.observe_then_act_chunks must be positive, got {observe_chunks}.")
+    if observe_interval <= 0:
+        raise ValueError(
+            f"EVALUATION.observe_then_act_interval must be positive, got {observe_interval}."
+        )
+    if observe_policy not in {"dummy", "scripted"}:
+        raise ValueError(
+            "EVALUATION.observe_then_act_observe_policy must be 'dummy' or 'scripted', "
+            f"got {observe_policy!r}."
+        )
+
+    if reset_ttt_state and hasattr(model, "reset_video_ttt_state"):
+        model.reset_video_ttt_state()
+
+    replay_images: list[Any] = []
+    pending_actions: list[list[float]] = []
+    predicted_future_video_clips: list[dict[str, Any]] = []
+    future_clip_psnr: list[float] = []
+    current_clip: Optional[dict[str, Any]] = None
+    current_replan_step = 0
+    current_replan_idx = -1
+    action_trace: list[list[float]] = []
+    eef_trace: list[list[float]] = []
+    payload_trace: list[list[float]] = []
+    carrier_trace: list[list[float]] = []
+    pickup_success = False
+    first_pickup_step: Optional[int] = None
+
+    total_budget = max_steps if count_observe_steps else num_steps_wait + observe_chunks * observe_interval + max_steps
+    pbar = None
+    try:
+        obs = env.reset(init_state=init_state)
+        planner = (
+            ScriptedDynamicCarrierPlanner(env, _planner_config_from_eval_cfg(cfg))
+            if observe_policy == "scripted"
+            else None
+        )
+        if planner is not None:
+            planner.reset()
+
+        done = False
+        success = False
+        elapsed_steps = 0
+        observe_steps_done = 0
+        observe_ttt_updates = 0
+        pbar = tqdm(total=total_budget, desc=f"trial {trial_idx + 1} observe_then_act")
+
+        for _ in range(num_steps_wait):
+            replay_images.append(get_libero_image(obs).copy())
+            action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+            action_trace.append(action.astype(float).tolist())
+            obs, _, done, _ = env.step(action)
+            if env.payload_attached_to_gripper and not pickup_success:
+                pickup_success = True
+                first_pickup_step = len(action_trace)
+            elapsed_steps += 1
+            pbar.update(1)
+            if done:
+                break
+
+        if not done:
+            for chunk_idx in range(observe_chunks):
+                if update_during_observe:
+                    _predict_action_chunk(
+                        obs=obs,
+                        task_description=task_description,
+                        model=model,
+                        processor=processor,
+                        cfg=cfg,
+                        action_horizon=action_horizon,
+                        input_w=input_w,
+                        input_h=input_h,
+                        model_device=model_device,
+                    )
+                    observe_ttt_updates += 1
+
+                for _ in range(observe_interval):
+                    replay_images.append(get_libero_image(obs).copy())
+                    if planner is not None:
+                        action = planner.act(obs).astype(np.float32)
+                    else:
+                        action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+                    eef_trace.append(env.eef_position(obs).astype(float).tolist())
+                    payload_trace.append(env.payload_position().astype(float).tolist())
+                    carrier_trace.append(env.carrier_position().astype(float).tolist())
+                    action_trace.append(action.astype(float).tolist())
+                    obs, _, done, _ = env.step(action)
+                    if env.payload_attached_to_gripper and not pickup_success:
+                        pickup_success = True
+                        first_pickup_step = len(action_trace)
+                    elapsed_steps += 1
+                    observe_steps_done += 1
+                    pbar.update(1)
+                    if done:
+                        break
+                if done:
+                    break
+
+        policy_budget = max_steps - elapsed_steps if count_observe_steps else max_steps
+        policy_budget = max(int(policy_budget), 0)
+        policy_steps = 0
+
+        for _ in range(policy_budget):
+            if done:
+                break
+            if len(pending_actions) == 0:
+                action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+                    obs=obs,
+                    task_description=task_description,
+                    model=model,
+                    processor=processor,
+                    cfg=cfg,
+                    action_horizon=action_horizon,
+                    input_w=input_w,
+                    input_h=input_h,
+                    model_device=model_device,
+                )
+                replay_images.append(imgs.copy())
+                if predicted_future_frames is not None:
+                    current_replan_idx += 1
+                    current_clip = {
+                        "replan_idx": current_replan_idx,
+                        "gt_frames": [imgs.copy()],
+                        "pred_frames": predicted_future_frames,
+                    }
+                else:
+                    current_clip = None
+                current_replan_step = 0
+                pending_actions = action_chunk[:replan_steps].tolist()
+            else:
+                replay_images.append(get_libero_image(obs).copy())
+
+            action = np.asarray(pending_actions.pop(0), dtype=np.float32)
+            eef_trace.append(env.eef_position(obs).astype(float).tolist())
+            payload_trace.append(env.payload_position().astype(float).tolist())
+            carrier_trace.append(env.carrier_position().astype(float).tolist())
+            action_trace.append(action.astype(float).tolist())
+            obs, _, done, _ = env.step(action)
+            if env.payload_attached_to_gripper and not pickup_success:
+                pickup_success = True
+                first_pickup_step = len(action_trace)
+            elapsed_steps += 1
+            policy_steps += 1
+            pbar.update(1)
+
+            if visualize_future_video and current_clip is not None:
+                current_replan_step += 1
+                if current_replan_step in capture_steps:
+                    current_clip["gt_frames"].append(get_libero_image(obs))
+                if done or len(pending_actions) == 0:
+                    expected = 1 + sum(1 for step in capture_steps if step <= current_replan_step)
+                    current_clip["pred_frames"] = current_clip["pred_frames"][:expected]
+                    current_clip["gt_frames"] = current_clip["gt_frames"][:expected]
+                    if len(current_clip["gt_frames"]) == len(current_clip["pred_frames"]):
+                        clip_psnr = _compute_clip_mean_psnr(
+                            current_clip["gt_frames"], current_clip["pred_frames"]
+                        )
+                        if clip_psnr is not None:
+                            future_clip_psnr.append(float(clip_psnr))
+                    predicted_future_video_clips.append(current_clip)
+                    current_clip = None
+
+            success = bool(env.check_success())
+            if done or success:
+                success = bool(env.check_success())
+                break
+        if pbar is not None:
+            pbar.close()
+
+        result = {
+            "trial_idx": int(trial_idx),
+            "dataset_episode_index": int(dataset_episode_index),
+            "case_id": case.case_id,
+            "access_mode": case.access_mode,
+            "trajectory_family": case.motion.family,
+            "seed": int(seed),
+            "task_description": task_description,
+            "success": bool(success),
+            "pickup_success": bool(pickup_success),
+            "first_pickup_step": int(first_pickup_step) if first_pickup_step is not None else None,
+            "steps": int(len(action_trace)),
+            "observe_then_act_chunks": int(observe_chunks),
+            "observe_then_act_interval": int(observe_interval),
+            "observe_then_act_policy": observe_policy,
+            "observe_then_act_ttt_updates": int(observe_ttt_updates),
+            "observe_steps": int(observe_steps_done),
+            "policy_steps": int(policy_steps),
+            "actions": action_trace,
+            "eef_xyz": eef_trace,
+            "payload_xyz": payload_trace,
+            "carrier_xyz": carrier_trace,
+        }
+        mean_psnr = float(np.mean(future_clip_psnr)) if len(future_clip_psnr) > 0 else None
+        return result, replay_images, predicted_future_video_clips, mean_psnr
+    finally:
+        if pbar is not None:
+            pbar.close()
         env.close()
 
 
@@ -478,7 +891,7 @@ def run_scripted_ttt_warmup_pass(
         seed=seed,
     )
     env = DynamicCarrierEnv(base_env, case)
-    planner = ScriptedDynamicCarrierPlanner(env, PlannerConfig())
+    planner = ScriptedDynamicCarrierPlanner(env, _planner_config_from_eval_cfg(cfg))
     task_description = _prompt_for_case(case, cfg)
     warmup_max_steps = cfg.EVALUATION.get("warmup_max_steps", None)
     if warmup_max_steps is None:
@@ -589,10 +1002,16 @@ def main(cfg: DictConfig) -> dict[str, Any]:
     warmup_update_interval = int(
         cfg.EVALUATION.get("warmup_update_interval", cfg.EVALUATION.get("replan_steps", 10))
     )
+    observe_then_act_chunks = int(cfg.EVALUATION.get("observe_then_act_chunks", 0))
     if warmup_passes < 0:
         raise ValueError(f"EVALUATION.warmup_passes must be non-negative, got {warmup_passes}.")
     if warmup_passes > 0 and warmup_policy != "scripted":
         raise ValueError(f"Only EVALUATION.warmup_policy=scripted is supported, got {warmup_policy}.")
+    if warmup_passes > 0 and observe_then_act_chunks > 0:
+        raise ValueError(
+            "Use only one adaptation protocol: set either EVALUATION.warmup_passes "
+            "or EVALUATION.observe_then_act_chunks, not both."
+        )
 
     results: dict[str, Any] = {
         "checkpoint": str(_resolve_path(cfg.ckpt)),
@@ -600,6 +1019,8 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         "total_episodes": int(len(cases)),
         "successes": 0,
         "success_rate": 0.0,
+        "pickup_successes": 0,
+        "pickup_success_rate": 0.0,
         "future_video_psnr_mean": None,
         "episodes": [],
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -609,20 +1030,63 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         "warmup_passes": int(warmup_passes),
         "warmup_policy": warmup_policy if warmup_passes > 0 else None,
         "warmup_update_interval": int(warmup_update_interval) if warmup_passes > 0 else None,
+        "repeat_eval_from_groups": bool(cfg.EVALUATION.get("repeat_eval_from_groups", False)),
+        "restart_markers": bool(warmup_passes > 0),
+        "observe_then_act_chunks": int(observe_then_act_chunks),
+        "observe_then_act_interval": (
+            int(_get_observe_then_act_interval(cfg)) if observe_then_act_chunks > 0 else None
+        ),
     }
     psnr_values: list[float] = []
+    tries_per_group = int(
+        cfg.EVALUATION.get(
+            "tries_per_group",
+            cfg.data.train.get("tries_per_group", max(warmup_passes + 1, 1)),
+        )
+    )
 
-    for trial_idx, (case, seed, dataset_episode_index) in enumerate(cases):
+    for trial_idx, record in enumerate(cases):
+        base_case: DynamicCarrierCase = record["case"]
+        case = base_case
+        seed = int(record["seed"])
+        dataset_episode_index = int(record["dataset_episode_index"])
         warmup_summaries: list[dict[str, Any]] = []
+        restart_marker_losses: list[Optional[float]] = []
         reset_ttt_state = True
-        if warmup_passes > 0:
+        if observe_then_act_chunks > 0:
+            episode, replay_images, future_clips, episode_psnr = run_observe_then_act_episode(
+                case=case,
+                seed=seed,
+                dataset_episode_index=dataset_episode_index,
+                model=model,
+                processor=processor,
+                cfg=cfg,
+                trial_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+                model_device=device,
+                reset_ttt_state=True,
+            )
+        elif warmup_passes > 0:
             if hasattr(model, "reset_video_ttt_state"):
                 model.reset_video_ttt_state()
             for pass_idx in range(warmup_passes):
+                if pass_idx > 0:
+                    restart_marker_losses.append(
+                        _apply_restart_ttt_marker(
+                            model=model,
+                            cfg=cfg,
+                            input_w=input_w,
+                            input_h=input_h,
+                            model_device=device,
+                        )
+                    )
+                warmup_case = _case_for_try(record, pass_idx, tries_per_group=tries_per_group)
                 warmup_summaries.append(
                     run_scripted_ttt_warmup_pass(
-                        case=case,
-                        seed=seed,
+                        case=warmup_case,
+                        seed=_seed_for_try(record, pass_idx),
                         model=model,
                         processor=processor,
                         cfg=cfg,
@@ -634,27 +1098,61 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                         model_device=device,
                     )
                 )
+            restart_marker_losses.append(
+                _apply_restart_ttt_marker(
+                    model=model,
+                    cfg=cfg,
+                    input_w=input_w,
+                    input_h=input_h,
+                    model_device=device,
+                )
+            )
+            case = _case_for_try(record, warmup_passes, tries_per_group=tries_per_group)
+            seed = _seed_for_try(record, warmup_passes)
+            dataset_episode_index = _episode_index_for_try(record, warmup_passes)
             reset_ttt_state = False
 
-        episode, replay_images, future_clips, episode_psnr = run_episode(
-            case=case,
-            seed=seed,
-            dataset_episode_index=dataset_episode_index,
-            model=model,
-            processor=processor,
-            cfg=cfg,
-            trial_idx=trial_idx,
-            action_horizon=action_horizon,
-            input_w=input_w,
-            input_h=input_h,
-            model_device=device,
-            reset_ttt_state=reset_ttt_state,
-        )
+            episode, replay_images, future_clips, episode_psnr = run_episode(
+                case=case,
+                seed=seed,
+                dataset_episode_index=dataset_episode_index,
+                model=model,
+                processor=processor,
+                cfg=cfg,
+                trial_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+                model_device=device,
+                reset_ttt_state=reset_ttt_state,
+            )
+        else:
+            episode, replay_images, future_clips, episode_psnr = run_episode(
+                case=case,
+                seed=seed,
+                dataset_episode_index=dataset_episode_index,
+                model=model,
+                processor=processor,
+                cfg=cfg,
+                trial_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+                model_device=device,
+                reset_ttt_state=reset_ttt_state,
+            )
         if warmup_passes > 0:
             episode["warmup_passes"] = int(warmup_passes)
             episode["warmup_summaries"] = warmup_summaries
+            episode["restart_marker_losses"] = restart_marker_losses
+            episode["repeat_group_id"] = int(record.get("group_id", trial_idx))
+            episode["base_case_id"] = base_case.case_id
+            episode["execution_try_index"] = int(warmup_passes)
+            episode["execution_case_id"] = case.case_id
         if episode["success"]:
             results["successes"] += 1
+        if episode.get("pickup_success", False):
+            results["pickup_successes"] += 1
         if episode_psnr is not None:
             episode["future_video_psnr"] = float(episode_psnr)
             psnr_values.append(float(episode_psnr))
@@ -703,11 +1201,13 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         results["episodes"].append(slim_episode)
 
         results["success_rate"] = results["successes"] / max(1, trial_idx + 1)
+        results["pickup_success_rate"] = results["pickup_successes"] / max(1, trial_idx + 1)
         with (run_dir / "results_partial.json").open("w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, cls=NumpyEncoder)
 
     results["duration"] = time.time() - start_time
     results["success_rate"] = results["successes"] / max(1, len(cases))
+    results["pickup_success_rate"] = results["pickup_successes"] / max(1, len(cases))
     if psnr_values:
         results["future_video_psnr_mean"] = float(np.mean(psnr_values))
 
@@ -718,6 +1218,10 @@ def main(cfg: DictConfig) -> dict[str, Any]:
     print(
         f"Dynamic carrier eval completed: {results['successes']}/{len(cases)} "
         f"successes ({results['success_rate']:.3f})"
+    )
+    print(
+        f"Dynamic carrier pickup completed: {results['pickup_successes']}/{len(cases)} "
+        f"pickups ({results['pickup_success_rate']:.3f})"
     )
     if results["future_video_psnr_mean"] is not None:
         print(f"Future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")

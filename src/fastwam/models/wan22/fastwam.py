@@ -1,4 +1,4 @@
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -754,8 +754,260 @@ class FastWAM(torch.nn.Module):
                 sliced[key] = value
         return sliced
 
-    def training_loss_video_ttt_repeat_attempt(self, sample: dict[str, Any], tiled: bool = False):
+    @staticmethod
+    def _select_video_ttt_state(
+        state: Optional[dict[str, torch.Tensor]],
+        indices: torch.Tensor,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if state is None:
+            return None
+        return {key: value.index_select(0, indices.to(device=value.device)) for key, value in state.items()}
+
+    @staticmethod
+    def _scatter_video_ttt_state(
+        state: Optional[dict[str, torch.Tensor]],
+        updated_state: Optional[dict[str, torch.Tensor]],
+        indices: torch.Tensor,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if updated_state is None:
+            return state
+        if state is None:
+            return updated_state
+        scattered = {}
+        for key, value in state.items():
+            index = indices.to(device=value.device)
+            if index.numel() == value.shape[0]:
+                scattered[key] = updated_state[key]
+            else:
+                scattered[key] = value.index_copy(0, index, updated_state[key])
+        return scattered
+
+    @staticmethod
+    def _slice_ttt_execution_chunk_sample(
+        sample: dict[str, Any],
+        chunk_idx: int,
+        indices: torch.Tensor,
+    ) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        base_keys = {
+            "context",
+            "context_mask",
+            "restart_context",
+            "restart_context_mask",
+        }
+        for key, value in sample.items():
+            if key in base_keys and isinstance(value, torch.Tensor):
+                sliced[key] = value.index_select(0, indices)
+
+        sequence_keys = {
+            "video": "ttt_execution_video",
+            "action": "ttt_execution_action",
+            "proprio": "ttt_execution_proprio",
+            "image_is_pad": "ttt_execution_image_is_pad",
+            "action_is_pad": "ttt_execution_action_is_pad",
+            "proprio_is_pad": "ttt_execution_proprio_is_pad",
+        }
+        for out_key, seq_key in sequence_keys.items():
+            value = sample.get(seq_key)
+            if isinstance(value, torch.Tensor):
+                sliced[out_key] = value.index_select(0, indices)[:, chunk_idx]
+        return sliced
+
+    @staticmethod
+    def _slice_ttt_try_sequence_chunk_sample(
+        sample: dict[str, Any],
+        try_idx: int,
+        chunk_idx: int,
+        indices: torch.Tensor,
+    ) -> dict[str, Any]:
+        sliced: dict[str, Any] = {}
+        for key in ("context", "context_mask"):
+            value = sample.get(key)
+            if isinstance(value, torch.Tensor):
+                selected = value.index_select(0, indices)
+                sliced[key] = selected[:, try_idx] if selected.ndim >= 3 else selected
+        for key in ("restart_context", "restart_context_mask"):
+            value = sample.get(key)
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value.index_select(0, indices)
+
+        sequence_keys = {
+            "video",
+            "action",
+            "proprio",
+            "image_is_pad",
+            "action_is_pad",
+            "proprio_is_pad",
+        }
+        for key in sequence_keys:
+            value = sample.get(key)
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value.index_select(0, indices)[:, try_idx, chunk_idx]
+        return sliced
+
+    def _training_loss_video_ttt_repeat_attempt_sequence(
+        self,
+        sample: dict[str, Any],
+        tiled: bool = False,
+        backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
+    ):
         video = sample["video"]
+        if video.ndim != 7:
+            raise ValueError(f"sequential repeat-attempt TTT expects video [B,R,N,3,T,H,W], got {tuple(video.shape)}.")
+        batch_size = int(video.shape[0])
+        num_tries = int(video.shape[1])
+        num_chunks = int(video.shape[2])
+        use_switch_chunks = bool(self.video_ttt_switch_chunks and num_tries > 1)
+        chunk_mask = sample.get("ttt_try_chunk_mask")
+        if chunk_mask is None:
+            chunk_mask = torch.ones((batch_size, num_tries, num_chunks), dtype=torch.bool)
+        if chunk_mask.ndim != 3 or tuple(chunk_mask.shape[:3]) != (batch_size, num_tries, num_chunks):
+            raise ValueError(
+                "`ttt_try_chunk_mask` must be [B,R,N] matching sequential repeat video, "
+                f"got {tuple(chunk_mask.shape)} vs {(batch_size, num_tries, num_chunks)}."
+            )
+        chunk_mask = chunk_mask.bool()
+
+        streaming_backward = backward_fn is not None
+        valid_count_total_expected = int(chunk_mask.sum().item())
+        if valid_count_total_expected <= 0:
+            raise ValueError("Sequential repeat-attempt TTT found no valid chunks.")
+        switch_count_expected = batch_size * (num_tries - 1) if use_switch_chunks else 0
+        ttt_loss_count_expected = max(valid_count_total_expected + switch_count_expected, 1)
+
+        state = None
+        loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_video_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_action_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_switch_loss_total = torch.zeros((), device=self.device, dtype=torch.float32)
+        ttt_loss_count = 0
+        ttt_switch_count = 0
+        valid_count_total = 0
+        black_first_frame_latents = None
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        for try_idx in range(num_tries):
+            if try_idx > 0 and use_switch_chunks:
+                restart_context = sample.get("restart_context")
+                restart_context_mask = sample.get("restart_context_mask")
+                if restart_context is None or restart_context_mask is None:
+                    raise ValueError("repeat-attempt TTT switch chunks require `restart_context`.")
+                restart_context = restart_context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+                restart_context_mask = restart_context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+                if black_first_frame_latents is None:
+                    black_video = torch.full(
+                        (
+                            batch_size,
+                            3,
+                            1,
+                            int(video.shape[-2]),
+                            int(video.shape[-1]),
+                        ),
+                        -1.0,
+                        device=self.device,
+                        dtype=self.torch_dtype,
+                    )
+                    black_first_frame_latents = self._encode_video_latents(black_video, tiled=tiled)
+                state, ttt_switch_loss = self._training_loss_video_ttt_switch_chunk(
+                    state=state,
+                    first_frame_latents=black_first_frame_latents,
+                    context=restart_context,
+                    context_mask=restart_context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                )
+                if ttt_switch_loss is not None:
+                    if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                        backward_fn(
+                            self.loss_lambda_video_ttt
+                            * ttt_switch_loss
+                            * (float(batch_size) / float(ttt_loss_count_expected)),
+                            retain_graph=True,
+                        )
+                    ttt_switch_loss_for_total = ttt_switch_loss.detach() if streaming_backward else ttt_switch_loss
+                    ttt_switch_loss_total = ttt_switch_loss_total + ttt_switch_loss_for_total * float(batch_size)
+                    ttt_loss_total = ttt_loss_total + ttt_switch_loss_for_total * float(batch_size)
+                    ttt_switch_count += batch_size
+                    ttt_loss_count += batch_size
+
+            for chunk_idx in range(num_chunks):
+                valid_indices = torch.nonzero(chunk_mask[:, try_idx, chunk_idx], as_tuple=False).flatten()
+                if valid_indices.numel() == 0:
+                    continue
+                sub_sample = self._slice_ttt_try_sequence_chunk_sample(sample, try_idx, chunk_idx, valid_indices)
+                sub_state = self._select_video_ttt_state(state, valid_indices.to(device=self.device))
+                inputs = self.build_inputs(sub_sample, tiled=tiled)
+                loss_outer, loss_video, loss_action, ttt_loss, sub_state = self._training_loss_video_ttt_one_chunk(
+                    inputs,
+                    state=sub_state,
+                )
+                valid_count = int(valid_indices.numel())
+                if streaming_backward:
+                    loss_for_backward = loss_outer * (
+                        float(valid_count) / float(valid_count_total_expected)
+                    )
+                    if ttt_loss is not None and self.loss_lambda_video_ttt != 0.0:
+                        loss_for_backward = loss_for_backward + self.loss_lambda_video_ttt * ttt_loss * (
+                            float(valid_count) / float(ttt_loss_count_expected)
+                        )
+                    backward_fn(loss_for_backward, retain_graph=True)
+                loss_outer_for_total = loss_outer.detach() if streaming_backward else loss_outer
+                loss_video_for_total = loss_video.detach() if streaming_backward else loss_video
+                loss_action_for_total = loss_action.detach() if streaming_backward else loss_action
+                loss_total = loss_total + loss_outer_for_total * float(valid_count)
+                loss_video_total = loss_video_total + loss_video_for_total * float(valid_count)
+                loss_action_total = loss_action_total + loss_action_for_total * float(valid_count)
+                valid_count_total += valid_count
+                if ttt_loss is not None:
+                    ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
+                    ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_count)
+                    ttt_loss_count += valid_count
+                state = self._scatter_video_ttt_state(
+                    state,
+                    sub_state,
+                    valid_indices.to(device=self.device),
+                )
+
+        if valid_count_total <= 0:
+            raise ValueError("Sequential repeat-attempt TTT found no valid chunks.")
+        loss_total = loss_total / float(valid_count_total)
+        loss_video = loss_video_total / float(valid_count_total)
+        loss_action = loss_action_total / float(valid_count_total)
+        loss_video_ttt = ttt_loss_total / float(max(ttt_loss_count, 1))
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_total = loss_total + self.loss_lambda_video_ttt * loss_video_ttt
+
+        valid_chunks_per_try = chunk_mask.to(dtype=torch.float32).sum(dim=2)
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_video_ttt": float(loss_video_ttt.detach().item()),
+            "video_ttt_num_tries": float(num_tries),
+            "video_ttt_act_chunks": float(valid_chunks_per_try.detach().mean().item()),
+            "video_ttt_total_act_chunks": float(valid_chunks_per_try.detach().sum(dim=1).mean().item()),
+            "video_ttt_switch_chunks": float(1 if use_switch_chunks else 0),
+        }
+        if ttt_switch_count > 0:
+            loss_dict["loss_video_ttt_switch"] = float(
+                (ttt_switch_loss_total / float(ttt_switch_count)).detach().item()
+            )
+        if self.loss_lambda_video_ttt != 0.0:
+            loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
+        if streaming_backward:
+            return loss_total.detach(), loss_dict, True
+        return loss_total, loss_dict
+
+    def training_loss_video_ttt_repeat_attempt(
+        self,
+        sample: dict[str, Any],
+        tiled: bool = False,
+        backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
+    ):
+        video = sample["video"]
+        if video.ndim == 7:
+            return self._training_loss_video_ttt_repeat_attempt_sequence(sample, tiled=tiled, backward_fn=backward_fn)
+        if backward_fn is not None:
+            raise ValueError("Streaming backward is only supported for sequential repeat-attempt TTT video [B,R,N,3,T,H,W].")
         if video.ndim != 6:
             raise ValueError(f"repeat-attempt TTT expects video [B,R,3,T,H,W], got {tuple(video.shape)}.")
         num_tries = int(video.shape[1])
@@ -839,7 +1091,12 @@ class FastWAM(torch.nn.Module):
             loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
         return loss_total, loss_dict
 
-    def training_loss_video_ttt_observe_then_act(self, sample: dict[str, Any], tiled: bool = False):
+    def training_loss_video_ttt_observe_then_act(
+        self,
+        sample: dict[str, Any],
+        tiled: bool = False,
+        backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
+    ):
         if "ttt_warmup_video" not in sample or "ttt_warmup_proprio" not in sample:
             raise ValueError("observe-then-act TTT requires `ttt_warmup_video` and `ttt_warmup_proprio`.")
 
@@ -856,6 +1113,16 @@ class FastWAM(torch.nn.Module):
         ttt_loss_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
         ttt_loss_count = 0
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+        streaming_backward = backward_fn is not None
+
+        execution_count_expected = int(warmup_video.shape[0])
+        execution_mask_for_counts = sample.get("ttt_execution_mask")
+        if isinstance(sample.get("ttt_execution_video"), torch.Tensor) and isinstance(execution_mask_for_counts, torch.Tensor):
+            execution_count_expected = int(execution_mask_for_counts.bool().sum().item())
+        if execution_count_expected <= 0:
+            raise ValueError("Observe-then-act TTT found no valid execution chunks.")
+        warmup_count_expected = int(warmup_video.shape[0] * warmup_video.shape[1])
+        ttt_loss_count_expected = max(warmup_count_expected + execution_count_expected, 1)
 
         for chunk_idx in range(int(warmup_video.shape[1])):
             frame = warmup_video[:, chunk_idx].unsqueeze(2)
@@ -876,19 +1143,106 @@ class FastWAM(torch.nn.Module):
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
             if ttt_loss is not None:
-                ttt_loss_total = ttt_loss_total + ttt_loss
-                ttt_loss_count += 1
+                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                    backward_fn(
+                        self.loss_lambda_video_ttt
+                        * ttt_loss
+                        * (float(warmup_video.shape[0]) / float(ttt_loss_count_expected)),
+                        retain_graph=True,
+                    )
+                ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
+                ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(warmup_video.shape[0])
+                ttt_loss_count += int(warmup_video.shape[0])
 
-        inputs = self.build_inputs(sample, tiled=tiled)
-        loss_outer, loss_video, loss_action, ttt_loss, state = self._training_loss_video_ttt_one_chunk(
-            inputs,
-            state=state,
-        )
-        if ttt_loss is not None:
-            ttt_loss_total = ttt_loss_total + ttt_loss
-            ttt_loss_count += 1
+        if "ttt_execution_video" in sample:
+            execution_video = sample["ttt_execution_video"]
+            execution_mask = sample.get("ttt_execution_mask")
+            if execution_video.ndim != 6:
+                raise ValueError(
+                    "`ttt_execution_video` must be [B,N,3,T,H,W], "
+                    f"got {tuple(execution_video.shape)}."
+                )
+            if execution_mask is None:
+                raise ValueError("`ttt_execution_mask` is required for sequential observe-then-act TTT.")
+            if execution_mask.ndim != 2 or execution_mask.shape[:2] != execution_video.shape[:2]:
+                raise ValueError(
+                    "`ttt_execution_mask` must be [B,N] matching `ttt_execution_video`, "
+                    f"got {tuple(execution_mask.shape)} vs {tuple(execution_video.shape[:2])}."
+                )
+
+            loss_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
+            loss_video_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
+            loss_action_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
+            valid_count_total = 0
+            execution_mask = execution_mask.bool()
+            valid_count_total_expected = int(execution_mask.sum().item())
+            if valid_count_total_expected <= 0:
+                raise ValueError("Sequential observe-then-act TTT found no valid execution chunks.")
+            for chunk_idx in range(int(execution_video.shape[1])):
+                valid_indices = torch.nonzero(execution_mask[:, chunk_idx], as_tuple=False).flatten()
+                if valid_indices.numel() == 0:
+                    continue
+                sub_sample = self._slice_ttt_execution_chunk_sample(sample, chunk_idx, valid_indices)
+                sub_state = self._select_video_ttt_state(state, valid_indices.to(device=self.device))
+                inputs = self.build_inputs(sub_sample, tiled=tiled)
+                loss_outer, loss_video, loss_action, ttt_loss, sub_state = self._training_loss_video_ttt_one_chunk(
+                    inputs,
+                    state=sub_state,
+                )
+                valid_count = int(valid_indices.numel())
+                if streaming_backward:
+                    loss_for_backward = loss_outer * (
+                        float(valid_count) / float(valid_count_total_expected)
+                    )
+                    if ttt_loss is not None and self.loss_lambda_video_ttt != 0.0:
+                        loss_for_backward = loss_for_backward + self.loss_lambda_video_ttt * ttt_loss * (
+                            float(valid_count) / float(ttt_loss_count_expected)
+                        )
+                    backward_fn(loss_for_backward, retain_graph=True)
+                loss_outer_for_total = loss_outer.detach() if streaming_backward else loss_outer
+                loss_video_for_total = loss_video.detach() if streaming_backward else loss_video
+                loss_action_for_total = loss_action.detach() if streaming_backward else loss_action
+                loss_total = loss_total + loss_outer_for_total * float(valid_count)
+                loss_video_total = loss_video_total + loss_video_for_total * float(valid_count)
+                loss_action_total = loss_action_total + loss_action_for_total * float(valid_count)
+                valid_count_total += valid_count
+                if ttt_loss is not None:
+                    ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
+                    ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_count)
+                    ttt_loss_count += valid_count
+                state = self._scatter_video_ttt_state(
+                    state,
+                    sub_state,
+                    valid_indices.to(device=self.device),
+                )
+            if valid_count_total <= 0:
+                raise ValueError("Sequential observe-then-act TTT found no valid execution chunks.")
+            loss_total = loss_total / float(valid_count_total)
+            loss_video = loss_video_total / float(valid_count_total)
+            loss_action = loss_action_total / float(valid_count_total)
+            valid_chunks_per_sample = execution_mask.to(dtype=torch.float32).sum(dim=1)
+        else:
+            inputs = self.build_inputs(sample, tiled=tiled)
+            loss_total, loss_video, loss_action, ttt_loss, state = self._training_loss_video_ttt_one_chunk(
+                inputs,
+                state=state,
+            )
+            if streaming_backward:
+                loss_for_backward = loss_total
+                if ttt_loss is not None and self.loss_lambda_video_ttt != 0.0:
+                    loss_for_backward = loss_for_backward + self.loss_lambda_video_ttt * ttt_loss * (
+                        float(warmup_video.shape[0]) / float(ttt_loss_count_expected)
+                    )
+                backward_fn(loss_for_backward, retain_graph=True)
+                loss_total = loss_total.detach()
+                loss_video = loss_video.detach()
+                loss_action = loss_action.detach()
+            if ttt_loss is not None:
+                ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
+                ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(warmup_video.shape[0])
+                ttt_loss_count += int(warmup_video.shape[0])
+            valid_chunks_per_sample = warmup_video.new_ones((warmup_video.shape[0],), dtype=torch.float32)
         loss_video_ttt = ttt_loss_total / float(max(ttt_loss_count, 1))
-        loss_total = loss_outer
         if self.loss_lambda_video_ttt != 0.0:
             loss_total = loss_total + self.loss_lambda_video_ttt * loss_video_ttt
         loss_dict = {
@@ -896,13 +1250,21 @@ class FastWAM(torch.nn.Module):
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_video_ttt": float(loss_video_ttt.detach().item()),
             "video_ttt_observe_chunks": float(warmup_video.shape[1]),
+            "video_ttt_act_chunks": float(valid_chunks_per_sample.detach().mean().item()),
             "video_ttt_switch_chunks": 0.0,
         }
         if self.loss_lambda_video_ttt != 0.0:
             loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
+        if streaming_backward:
+            return loss_total.detach(), loss_dict, True
         return loss_total, loss_dict
 
-    def training_loss_video_ttt_observation(self, sample, tiled: bool = False):
+    def training_loss_video_ttt_observation(
+        self,
+        sample,
+        tiled: bool = False,
+        backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
+    ):
         """TTT training with repeated same-episode inner loops.
 
         Each outer batch item is treated as one environment instance. The same
@@ -913,10 +1275,12 @@ class FastWAM(torch.nn.Module):
         """
         if not self.video_ttt_enabled:
             raise ValueError("`training_loss_video_ttt_observation` requires `model.video_ttt.enabled=true`.")
-        if isinstance(sample.get("video"), torch.Tensor) and sample["video"].ndim == 6:
-            return self.training_loss_video_ttt_repeat_attempt(sample, tiled=tiled)
+        if isinstance(sample.get("video"), torch.Tensor) and sample["video"].ndim in {6, 7}:
+            return self.training_loss_video_ttt_repeat_attempt(sample, tiled=tiled, backward_fn=backward_fn)
         if "ttt_warmup_video" in sample:
-            return self.training_loss_video_ttt_observe_then_act(sample, tiled=tiled)
+            return self.training_loss_video_ttt_observe_then_act(sample, tiled=tiled, backward_fn=backward_fn)
+        if backward_fn is not None:
+            raise ValueError("Streaming backward is only supported for sequential TTT training samples.")
 
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
@@ -1149,9 +1513,16 @@ class FastWAM(torch.nn.Module):
             loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
         return loss_total, loss_dict
 
-    def training_loss(self, sample, tiled: bool = False):
+    def training_loss(
+        self,
+        sample,
+        tiled: bool = False,
+        backward_fn: Optional[Callable[[torch.Tensor], None]] = None,
+    ):
         if self.video_ttt_observation_training:
-            return self.training_loss_video_ttt_observation(sample, tiled=tiled)
+            return self.training_loss_video_ttt_observation(sample, tiled=tiled, backward_fn=backward_fn)
+        if backward_fn is not None:
+            raise ValueError("Streaming backward is only supported for video TTT observation training.")
 
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]

@@ -179,6 +179,11 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
+        loader_kwargs = {}
+        if self.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -186,7 +191,9 @@ class Wan22Trainer:
             sampler=self.train_sampler,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
+            drop_last=True,
             worker_init_fn=worker_init_fn,
+            **loader_kwargs,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -719,6 +726,7 @@ class Wan22Trainer:
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
+                self.train_sampler.set_epoch(self.epoch)
                 data_iter = iter(self.train_loader)
                 continue
 
@@ -726,8 +734,18 @@ class Wan22Trainer:
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
-                self.accelerator.backward(loss)
+                    use_streaming_backward = bool(getattr(train_model, "video_ttt_observation_training", False))
+                    if use_streaming_backward and "backward_fn" in inspect.signature(train_model.training_loss).parameters:
+                        loss_result = train_model.training_loss(sample, backward_fn=self.accelerator.backward)
+                    else:
+                        loss_result = train_model.training_loss(sample)
+                if len(loss_result) == 3:
+                    loss, loss_dict, backward_done = loss_result
+                else:
+                    loss, loss_dict = loss_result
+                    backward_done = False
+                if not backward_done:
+                    self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)

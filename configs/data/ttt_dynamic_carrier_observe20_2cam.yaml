@@ -32,6 +32,7 @@ train:
   tries_per_group: 1
   observe_chunks: 20
   chunk_interval: 10
+  entry_repeat: 8
   pretrained_norm_stats: null
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
