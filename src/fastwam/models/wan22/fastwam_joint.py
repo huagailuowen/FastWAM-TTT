@@ -67,6 +67,8 @@ class FastWAMJoint(FastWAM):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
+        update_video_ttt: bool = True,
+        ttt_global_time: Optional[int | float | torch.Tensor] = None,
     ) -> dict[str, Any]:
         if test_action_with_infer_action:
             logger.warning(
@@ -90,6 +92,8 @@ class FastWAMJoint(FastWAM):
             rand_device=rand_device,
             tiled=tiled,
             test_action_with_infer_action=False,
+            update_video_ttt=update_video_ttt,
+            ttt_global_time=ttt_global_time,
         )
 
     @torch.no_grad()
@@ -109,6 +113,8 @@ class FastWAMJoint(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        update_video_ttt: bool = True,
+        ttt_global_time: Optional[int | float | torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
 
@@ -194,6 +200,35 @@ class FastWAMJoint(FastWAM):
                 context_mask=context_mask,
                 proprio=proprio,
             )
+        if self.video_ttt_enabled and update_video_ttt:
+            if self.video_ttt_uses_layer_hook:
+                _, _ = self._update_video_ttt_observation_inline(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    global_time=ttt_global_time,
+                    compute_loss=False,
+                )
+            else:
+                observation_tokens = self._build_video_ttt_observation_tokens(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    global_time=ttt_global_time,
+                )
+                _, _, _ = self._apply_video_ttt_observation(
+                    observation_tokens,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    update_tokens=observation_tokens,
+                    compute_loss=False,
+                )
 
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -225,6 +260,8 @@ class FastWAMJoint(FastWAM):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=None,
+                use_video_ttt=True,
+                video_ttt_global_time=ttt_global_time,
             )
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)

@@ -54,7 +54,10 @@ from experiments.libero.eval_libero_single import (  # noqa: E402
     _select_predicted_future_frames,
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor  # noqa: E402
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # noqa: E402
+from fastwam.datasets.lerobot.robot_video_dataset import (  # noqa: E402
+    DEFAULT_PROMPT,
+    DEFAULT_TTT_OBSERVATION_INSTRUCTION,
+)
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
 from fastwam.utils.pytorch_utils import set_global_seed  # noqa: E402
 from ttt4dynamics.cases import DynamicCarrierCase  # noqa: E402
@@ -210,6 +213,19 @@ def _prompt_for_case(case: DynamicCarrierCase, cfg: DictConfig) -> str:
     return FLAT_PROMPT
 
 
+def _observation_prompt_for_ttt(cfg: DictConfig) -> str:
+    instruction = str(
+        cfg.EVALUATION.get(
+            "ttt_observation_instruction",
+            cfg.data.train.get(
+                "ttt_observation_instruction",
+                DEFAULT_TTT_OBSERVATION_INSTRUCTION,
+            ),
+        )
+    )
+    return DEFAULT_PROMPT.format(task=instruction)
+
+
 def _planner_config_from_eval_cfg(cfg: DictConfig) -> PlannerConfig:
     return PlannerConfig(
         intercept_lead_s=float(cfg.EVALUATION.get("intercept_lead_s", 0.42)),
@@ -228,6 +244,55 @@ def _get_observe_then_act_interval(cfg: DictConfig) -> int:
             cfg.data.train.get("chunk_interval", cfg.EVALUATION.get("replan_steps", 10)),
         )
     )
+
+
+def _get_observe_then_act_update_interval(cfg: DictConfig) -> int:
+    return int(
+        cfg.EVALUATION.get(
+            "observe_then_act_update_interval",
+            cfg.data.train.get("chunk_interval", _get_observe_then_act_interval(cfg)),
+        )
+    )
+
+
+def _select_observe_then_act_frames(cfg: DictConfig, *, update_interval: int, max_chunks: int) -> int:
+    explicit = cfg.EVALUATION.get("observe_then_act_frames", None)
+    if explicit is not None:
+        observe_frames = int(explicit)
+    else:
+        default_frames = int(max_chunks * update_interval)
+        min_frames = int(
+            cfg.EVALUATION.get(
+                "observe_then_act_frames_min",
+                cfg.data.train.get("observe_frames_min", default_frames),
+            )
+        )
+        max_frames = int(
+            cfg.EVALUATION.get(
+                "observe_then_act_frames_max",
+                cfg.data.train.get("observe_frames_max", default_frames),
+            )
+        )
+        if min_frames > max_frames:
+            raise ValueError("observe_then_act_frames_min cannot be greater than observe_then_act_frames_max.")
+        random_frames = bool(
+            cfg.EVALUATION.get(
+                "observe_then_act_random_frames",
+                cfg.data.train.get("random_observe_frames", False),
+            )
+        )
+        if random_frames and min_frames < max_frames:
+            choices = np.arange(min_frames, max_frames + 1, int(update_interval), dtype=np.int64)
+            observe_frames = int(np.random.choice(choices))
+        else:
+            observe_frames = int(max_frames)
+    if observe_frames <= 0:
+        raise ValueError(f"observe_then_act_frames must be positive, got {observe_frames}.")
+    if observe_frames % int(update_interval) != 0:
+        raise ValueError(
+            f"observe_then_act_frames={observe_frames} must be divisible by update_interval={update_interval}."
+        )
+    return int(observe_frames)
 
 
 def _model_has_video_ttt_adapter(model: torch.nn.Module) -> bool:
@@ -396,6 +461,7 @@ def _apply_restart_ttt_marker(
         context=context,
         context_mask=context_mask,
         fuse_vae_embedding_in_latents=bool(getattr(model.video_expert, "fuse_vae_embedding_in_latents", False)),
+        global_time=0,
     )
     _, _, ttt_loss = model._apply_video_ttt_observation(
         tokens,
@@ -409,6 +475,63 @@ def _apply_restart_ttt_marker(
     return float(ttt_loss.detach().float().cpu().item())
 
 
+@torch.no_grad()
+def _apply_observation_ttt_update(
+    *,
+    obs: dict[str, Any],
+    task_description: str,
+    model: torch.nn.Module,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+    input_w: int,
+    input_h: int,
+    model_device: str,
+    ttt_global_time: int = 0,
+) -> tuple[Optional[float], float, dict[str, np.ndarray]]:
+    if not _model_has_video_ttt_adapter(model) or not hasattr(model, "_apply_video_ttt_observation"):
+        return None, 0.0, {}
+    start_time = time.perf_counter()
+    del task_description
+    prompt = _observation_prompt_for_ttt(cfg)
+    image, proprio, imgs = _obs_to_model_input(
+        obs,
+        cfg=cfg,
+        processor=processor,
+        width=input_w,
+        height=input_h,
+        device=model_device,
+        dtype=model.torch_dtype,
+    )
+    context, context_mask = model.encode_prompt(prompt)
+    if getattr(model, "proprio_encoder", None) is not None:
+        context, context_mask = model._append_proprio_to_context(
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+        )
+    first_frame_latents = model._encode_input_image_latents_tensor(
+        input_image=image,
+        tiled=bool(cfg.EVALUATION.get("tiled", False)),
+    )
+    tokens = model._build_video_ttt_observation_tokens(
+        first_frame_latents=first_frame_latents,
+        context=context,
+        context_mask=context_mask,
+        fuse_vae_embedding_in_latents=bool(getattr(model.video_expert, "fuse_vae_embedding_in_latents", False)),
+        global_time=int(ttt_global_time),
+    )
+    _, _, ttt_loss = model._apply_video_ttt_observation(
+        tokens,
+        state=model._video_ttt_inference_state,
+        persist_state=True,
+        update=True,
+        update_tokens=tokens,
+    )
+    elapsed = float(time.perf_counter() - start_time)
+    loss = None if ttt_loss is None else float(ttt_loss.detach().float().cpu().item())
+    return loss, elapsed, imgs
+
+
 def _predict_action_chunk(
     obs: dict[str, Any],
     task_description: str,
@@ -420,6 +543,8 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    update_video_ttt: bool = True,
+    ttt_global_time: int = 0,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], Optional[list[Image.Image]]]:
     num_inference_steps = int(
         cfg.EVALUATION.get("num_inference_steps", cfg.get("eval_num_inference_steps", 20))
@@ -452,11 +577,14 @@ def _predict_action_chunk(
         "seed": seed,
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
+        "update_video_ttt": bool(update_video_ttt),
+        "ttt_global_time": int(ttt_global_time),
     }
 
     predicted_future_frames = None
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+        infer_kwargs["test_action_with_infer_action"] = False
         with torch.no_grad():
             pred = model.infer_joint(**infer_kwargs)
         predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
@@ -555,6 +683,7 @@ def run_episode(
                     input_w=input_w,
                     input_h=input_h,
                     model_device=model_device,
+                    ttt_global_time=len(action_trace) // 2,
                 )
                 replay_images.append(imgs.copy())
                 if predicted_future_frames is not None:
@@ -651,23 +780,45 @@ def run_observe_then_act_episode(
     env = DynamicCarrierEnv(base_env, case)
     task_description = _prompt_for_case(case, cfg)
     max_steps = int(cfg.EVALUATION.get("max_steps", case.max_steps))
-    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 0))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
     observe_chunks = int(cfg.EVALUATION.get("observe_then_act_chunks", 0))
     observe_interval = _get_observe_then_act_interval(cfg)
+    observe_update_interval = _get_observe_then_act_update_interval(cfg)
+    observe_frames = _select_observe_then_act_frames(
+        cfg,
+        update_interval=observe_update_interval,
+        max_chunks=observe_chunks,
+    )
+    observe_update_chunks = int(observe_frames // observe_update_interval)
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", observe_interval))
     observe_policy = str(cfg.EVALUATION.get("observe_then_act_observe_policy", "dummy"))
     count_observe_steps = bool(cfg.EVALUATION.get("observe_then_act_count_observe_steps", True))
     update_during_observe = bool(
         cfg.EVALUATION.get("observe_then_act_update_during_observe", True)
     ) and _model_has_video_ttt_adapter(model)
+    update_during_policy = bool(
+        cfg.EVALUATION.get("observe_then_act_update_during_policy", True)
+    ) and _model_has_video_ttt_adapter(model)
+    action_infer_updates_ttt = bool(
+        cfg.EVALUATION.get("observe_then_act_action_infer_updates_ttt", False)
+    )
 
     if observe_chunks <= 0:
         raise ValueError(f"EVALUATION.observe_then_act_chunks must be positive, got {observe_chunks}.")
     if observe_interval <= 0:
         raise ValueError(
             f"EVALUATION.observe_then_act_interval must be positive, got {observe_interval}."
+        )
+    if observe_update_interval <= 0:
+        raise ValueError(
+            f"EVALUATION.observe_then_act_update_interval must be positive, got {observe_update_interval}."
+        )
+    if observe_update_chunks > observe_chunks:
+        raise ValueError(
+            f"Selected observe warmup needs {observe_update_chunks} updates, "
+            f"but observe_then_act_chunks only allows {observe_chunks}."
         )
     if observe_policy not in {"dummy", "scripted"}:
         raise ValueError(
@@ -692,7 +843,11 @@ def run_observe_then_act_episode(
     pickup_success = False
     first_pickup_step: Optional[int] = None
 
-    total_budget = max_steps if count_observe_steps else num_steps_wait + observe_chunks * observe_interval + max_steps
+    total_budget = (
+        max_steps
+        if count_observe_steps
+        else num_steps_wait + observe_frames + max_steps
+    )
     pbar = None
     try:
         obs = env.reset(init_state=init_state)
@@ -709,6 +864,9 @@ def run_observe_then_act_episode(
         elapsed_steps = 0
         observe_steps_done = 0
         observe_ttt_updates = 0
+        policy_ttt_updates = 0
+        ttt_update_seconds: list[float] = []
+        action_infer_seconds: list[float] = []
         pbar = tqdm(total=total_budget, desc=f"trial {trial_idx + 1} observe_then_act")
 
         for _ in range(num_steps_wait):
@@ -724,23 +882,30 @@ def run_observe_then_act_episode(
             if done:
                 break
 
+        ttt_time_origin_step = int(elapsed_steps)
+        ttt_time_stride = max(int(cfg.data.train.get("ttt_time_stride", 2)), 1)
+
+        def relative_ttt_time() -> int:
+            return max(int(elapsed_steps) - ttt_time_origin_step, 0) // ttt_time_stride
+
         if not done:
-            for chunk_idx in range(observe_chunks):
+            for chunk_idx in range(observe_update_chunks):
                 if update_during_observe:
-                    _predict_action_chunk(
+                    _, update_elapsed, _ = _apply_observation_ttt_update(
                         obs=obs,
                         task_description=task_description,
                         model=model,
                         processor=processor,
                         cfg=cfg,
-                        action_horizon=action_horizon,
                         input_w=input_w,
                         input_h=input_h,
                         model_device=model_device,
+                        ttt_global_time=relative_ttt_time(),
                     )
+                    ttt_update_seconds.append(update_elapsed)
                     observe_ttt_updates += 1
 
-                for _ in range(observe_interval):
+                for _ in range(observe_update_interval):
                     replay_images.append(get_libero_image(obs).copy())
                     if planner is not None:
                         action = planner.act(obs).astype(np.float32)
@@ -769,7 +934,25 @@ def run_observe_then_act_episode(
         for _ in range(policy_budget):
             if done:
                 break
+            if (
+                update_during_policy
+                and policy_steps % observe_update_interval == 0
+            ):
+                _, update_elapsed, _ = _apply_observation_ttt_update(
+                    obs=obs,
+                    task_description=task_description,
+                    model=model,
+                    processor=processor,
+                    cfg=cfg,
+                    input_w=input_w,
+                    input_h=input_h,
+                    model_device=model_device,
+                    ttt_global_time=relative_ttt_time(),
+                )
+                ttt_update_seconds.append(update_elapsed)
+                policy_ttt_updates += 1
             if len(pending_actions) == 0:
+                infer_start = time.perf_counter()
                 action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                     obs=obs,
                     task_description=task_description,
@@ -780,7 +963,10 @@ def run_observe_then_act_episode(
                     input_w=input_w,
                     input_h=input_h,
                     model_device=model_device,
+                    update_video_ttt=action_infer_updates_ttt,
+                    ttt_global_time=relative_ttt_time(),
                 )
+                action_infer_seconds.append(float(time.perf_counter() - infer_start))
                 replay_images.append(imgs.copy())
                 if predicted_future_frames is not None:
                     current_replan_idx += 1
@@ -845,10 +1031,22 @@ def run_observe_then_act_episode(
             "pickup_success": bool(pickup_success),
             "first_pickup_step": int(first_pickup_step) if first_pickup_step is not None else None,
             "steps": int(len(action_trace)),
-            "observe_then_act_chunks": int(observe_chunks),
+            "observe_then_act_chunks": int(observe_update_chunks),
+            "observe_then_act_max_chunks": int(observe_chunks),
             "observe_then_act_interval": int(observe_interval),
+            "observe_then_act_update_interval": int(observe_update_interval),
+            "observe_then_act_observe_frames": int(observe_frames),
             "observe_then_act_policy": observe_policy,
             "observe_then_act_ttt_updates": int(observe_ttt_updates),
+            "observe_then_act_policy_ttt_updates": int(policy_ttt_updates),
+            "observe_then_act_update_during_policy": bool(update_during_policy),
+            "observe_then_act_action_infer_updates_ttt": bool(action_infer_updates_ttt),
+            "observe_then_act_mean_ttt_update_s": (
+                float(np.mean(ttt_update_seconds)) if len(ttt_update_seconds) > 0 else None
+            ),
+            "observe_then_act_mean_action_infer_s": (
+                float(np.mean(action_infer_seconds)) if len(action_infer_seconds) > 0 else None
+            ),
             "observe_steps": int(observe_steps_done),
             "policy_steps": int(policy_steps),
             "actions": action_trace,
@@ -930,6 +1128,7 @@ def run_scripted_ttt_warmup_pass(
                         input_w=input_w,
                         input_h=input_h,
                         model_device=model_device,
+                        ttt_global_time=t // 2,
                     )
                     ttt_updates += 1
                 action = planner.act(obs).astype(np.float32)
@@ -1035,6 +1234,9 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         "observe_then_act_chunks": int(observe_then_act_chunks),
         "observe_then_act_interval": (
             int(_get_observe_then_act_interval(cfg)) if observe_then_act_chunks > 0 else None
+        ),
+        "observe_then_act_update_interval": (
+            int(_get_observe_then_act_update_interval(cfg)) if observe_then_act_chunks > 0 else None
         ),
     }
     psnr_values: list[float] = []

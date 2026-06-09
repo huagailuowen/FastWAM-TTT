@@ -1,12 +1,12 @@
 # @package _global_
 
 defaults:
-  - override /data: ttt_dynamic_carrier_observe20_2cam
+  - override /data: ttt_dynamic_carrier_slow100_observe10_2cam
   - override /model: fastwam
   - _self_
 
 batch_size: 4
-num_workers: 8
+num_workers: 4
 gradient_accumulation_steps: 1
 
 model:
@@ -16,6 +16,7 @@ model:
   video_ttt:
     enabled: true
     observation_training: true
+    w0_training: false
     train_backbone: false
     train_residual_gate: true
     num_tries: 1
@@ -27,6 +28,8 @@ model:
     ttt_lr: 0.5
     inner_update_mode: scan
     scan_kernel: triton
+    observe_prefill_group_size: 10
+    execution_backward_group_size: 2
     use_global_rope: true
     time_stride: 2
     include_context_tokens: true
@@ -49,8 +52,8 @@ eval_every: 0
 eval_num_inference_steps: 10
 
 weight_decay: 1.0e-2
-resume: ./runs/ttt_dynamic_carrier_cream_2cam224_ft/20260531_0527_plain_gpu/checkpoints/weights/step_010000.pt
+resume: null
 
 wandb:
   enabled: false
-  name: ttt_dynamic_carrier_observe20_2cam224_video_ttt
+  name: ttt_dynamic_carrier_slow100_observe_ttt_2cam224_video_ttt

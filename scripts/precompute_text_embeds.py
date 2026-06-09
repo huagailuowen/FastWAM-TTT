@@ -13,7 +13,10 @@ import torch.distributed as dist
 from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.datasets.lerobot.robot_video_dataset import (
+    DEFAULT_PROMPT,
+    DEFAULT_TTT_OBSERVATION_INSTRUCTION,
+)
 from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
@@ -105,6 +108,15 @@ def _collect_dataset_settings(data_cfg: DictConfig):
             if restart_prompt not in seen_extra_prompts:
                 seen_extra_prompts.add(restart_prompt)
                 extra_prompts.append(restart_prompt)
+
+        observation_instruction = node.get("ttt_observation_instruction")
+        if observation_instruction is None and str(node.get("ttt_mode", "")) == "observe_then_act":
+            observation_instruction = DEFAULT_TTT_OBSERVATION_INSTRUCTION
+        if observation_instruction is not None and str(observation_instruction).strip():
+            observation_prompt = DEFAULT_PROMPT.format(task=str(observation_instruction).strip())
+            if observation_prompt not in seen_extra_prompts:
+                seen_extra_prompts.add(observation_prompt)
+                extra_prompts.append(observation_prompt)
 
         logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
 

@@ -4,6 +4,7 @@ import inspect
 import os
 import re
 import shutil
+from datetime import timedelta
 from math import ceil
 from pathlib import Path
 import time
@@ -11,6 +12,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
@@ -37,6 +39,8 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        self.dataloader_prefetch_factor = int(cfg.get("dataloader_prefetch_factor", 2) or 2)
+        self.dataloader_persistent_workers = bool(cfg.get("dataloader_persistent_workers", True))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -57,11 +61,16 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self.distributed_timeout_minutes = float(cfg.get("distributed_timeout_minutes", 120.0))
+        init_pg_kwargs = InitProcessGroupKwargs(
+            timeout=timedelta(minutes=self.distributed_timeout_minutes)
+        )
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            kwargs_handlers=[init_pg_kwargs],
         )
         
         ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
@@ -78,6 +87,10 @@ class Wan22Trainer:
             self.accelerator.mixed_precision,
             self.gradient_accumulation_steps,
             self.max_grad_norm,
+        )
+        logger.info(
+            "distributed process group timeout: %.1f minutes",
+            self.distributed_timeout_minutes,
         )
         logger.info("using accelerator.device=%s", self.accelerator.device)
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
@@ -181,8 +194,8 @@ class Wan22Trainer:
         )
         loader_kwargs = {}
         if self.num_workers > 0:
-            loader_kwargs["persistent_workers"] = True
-            loader_kwargs["prefetch_factor"] = 2
+            loader_kwargs["persistent_workers"] = self.dataloader_persistent_workers
+            loader_kwargs["prefetch_factor"] = max(int(self.dataloader_prefetch_factor), 1)
 
         return DataLoader(
             dataset,

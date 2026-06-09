@@ -243,6 +243,7 @@ class FastWAMIDM(FastWAMJoint):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        update_video_ttt: bool = True,
     ) -> dict[str, Any]:
         # Reuse infer_joint pipeline and keep infer_action output contract.
         out = self.infer_joint(
@@ -262,6 +263,7 @@ class FastWAMIDM(FastWAMJoint):
             rand_device=rand_device,
             tiled=tiled,
             test_action_with_infer_action=False,
+            update_video_ttt=update_video_ttt,
         )
         return {"action": out["action"]}
 
@@ -284,8 +286,9 @@ class FastWAMIDM(FastWAMJoint):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
+        update_video_ttt: bool = True,
     ) -> dict[str, Any]:
-        del negative_prompt, text_cfg_scale, test_action_with_infer_action
+        del negative_prompt, text_cfg_scale, test_action_with_infer_action, update_video_ttt
         self.eval()
 
         if action is not None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -261,6 +261,7 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
+        video_ttt_hook: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -337,6 +338,8 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
+            if video_ttt_hook is not None:
+                x = video_ttt_hook(layer_idx, x)
             kv_cache.append({"k": k, "v": v})
         return kv_cache
 
@@ -451,6 +454,7 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        video_ttt_hook: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -550,6 +554,8 @@ class MoT(nn.Module):
                     context_payload=context_payload,
                 )
 
+                if name == "video" and video_ttt_hook is not None:
+                    updated_tokens = video_ttt_hook(layer_idx, updated_tokens)
                 tokens_all[name] = updated_tokens
                 start = end
 

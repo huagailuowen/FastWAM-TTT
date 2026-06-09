@@ -30,6 +30,7 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+distributed_timeout_minutes: 120
 
 # wandb
 wandb:

@@ -1,7 +1,10 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoTTTGroupedDataset
   dataset_dirs:
-    - ./data/ttt_dynamic_carrier_observe20_200_lerobot
+    - ./data/ttt_dynamic_carrier_slow100_observe10_shard00_lerobot
+    - ./data/ttt_dynamic_carrier_slow100_observe10_shard01_lerobot
+    - ./data/ttt_dynamic_carrier_slow100_observe10_shard02_lerobot
+    - ./data/ttt_dynamic_carrier_slow100_observe10_shard03_lerobot
   shape_meta:
     images:
       - key: image
@@ -65,5 +68,5 @@ train:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/ttt_dynamic_carrier_observe20
+  text_embedding_cache_dir: ./data/text_embeds_cache/ttt_dynamic_carrier_slow100_observe10
   context_len: 128

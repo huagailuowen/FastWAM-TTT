@@ -64,10 +64,12 @@ video_ttt:
   observation_training: false
   train_backbone: false
   train_residual_gate: true
+  w0_training: false
   num_tries: 1
   switch_chunks: false
   mini_batch_size: 64
   ttt_lr: 0.1
+  scan_kernel: torch
   init_std: 0.02
   residual_gate_init: 0.0
   residual_gate_override: null

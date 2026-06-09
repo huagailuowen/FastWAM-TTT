@@ -97,6 +97,55 @@ class FastWAM(torch.nn.Module):
         self.video_ttt_train_residual_gate = bool(video_ttt_config.get("train_residual_gate", True))
         self.video_ttt_num_tries = max(int(video_ttt_config.get("num_tries", 1)), 1)
         self.video_ttt_switch_chunks = bool(video_ttt_config.get("switch_chunks", False))
+        self.video_ttt_w0_training = bool(video_ttt_config.get("w0_training", False))
+        self.video_ttt_observe_prefill_group_size = max(
+            int(video_ttt_config.get("observe_prefill_group_size", 1)),
+            1,
+        )
+        self.video_ttt_execution_backward_group_size = max(
+            int(video_ttt_config.get("execution_backward_group_size", 1)),
+            1,
+        )
+        self.video_ttt_time_stride = max(int(video_ttt_config.get("time_stride", 2)), 1)
+        self.video_ttt_include_context_tokens = bool(video_ttt_config.get("include_context_tokens", True))
+        default_state_tokens = 1 if self.proprio_dim is not None else 0
+        self.video_ttt_state_token_count = max(
+            int(video_ttt_config.get("state_token_count", default_state_tokens)),
+            0,
+        )
+        video_ttt_uses_layer_hook = bool(
+            video_ttt_config.get(
+                "use_layer_hook",
+                "num_layers" in video_ttt_config
+                or video_ttt_config.get("layer_indices", None) is not None
+                or video_ttt_config.get("rank", None) is not None,
+            )
+        )
+        self.video_ttt_uses_layer_hook = video_ttt_uses_layer_hook
+        video_ttt_num_layers = max(int(video_ttt_config.get("num_layers", 1)), 1)
+        configured_layer_indices = video_ttt_config.get("layer_indices", None)
+        if not video_ttt_uses_layer_hook:
+            layer_indices = ()
+        elif configured_layer_indices is None:
+            layer_indices = self._uniform_video_ttt_layer_indices(
+                total_layers=len(self.video_expert.blocks),
+                num_ttt_layers=video_ttt_num_layers,
+            )
+        else:
+            layer_indices = tuple(int(idx) for idx in configured_layer_indices)
+            if len(layer_indices) != video_ttt_num_layers:
+                raise ValueError(
+                    "`video_ttt.layer_indices` length must match `video_ttt.num_layers`, "
+                    f"got {len(layer_indices)} and {video_ttt_num_layers}."
+                )
+        if len(set(layer_indices)) != len(layer_indices):
+            raise ValueError(f"`video_ttt.layer_indices` must be unique, got {layer_indices}.")
+        if any(idx < 0 or idx >= len(self.video_expert.blocks) for idx in layer_indices):
+            raise ValueError(
+                f"`video_ttt.layer_indices` must be in [0, {len(self.video_expert.blocks)}), got {layer_indices}."
+            )
+        self.video_ttt_layer_indices = tuple(layer_indices)
+        self.video_ttt_layer_to_slot = {int(layer_idx): slot_idx for slot_idx, layer_idx in enumerate(layer_indices)}
         residual_gate_override = video_ttt_config.get("residual_gate_override", None)
         self.video_ttt_residual_gate_override = (
             None if residual_gate_override is None else float(residual_gate_override)
@@ -109,6 +158,12 @@ class FastWAM(torch.nn.Module):
                 ttt_lr=float(video_ttt_config.get("ttt_lr", 0.1)),
                 init_std=float(video_ttt_config.get("init_std", 0.02)),
                 residual_gate_init=float(video_ttt_config.get("residual_gate_init", 0.0)),
+                num_layers=video_ttt_num_layers,
+                rank=video_ttt_config.get("rank", None),
+                inner_update_mode=str(video_ttt_config.get("inner_update_mode", "scan")),
+                scan_kernel=str(video_ttt_config.get("scan_kernel", "torch")),
+                use_global_rope=bool(video_ttt_config.get("use_global_rope", True)),
+                rope_theta=float(video_ttt_config.get("rope_theta", 10000.0)),
             ).to(dtype=torch_dtype)
             self.mot.add_module("video_ttt_adapter", video_ttt_adapter)
 
@@ -221,6 +276,21 @@ class FastWAM(torch.nn.Module):
         self.vae.to(*args, **kwargs)
         return self
 
+    @staticmethod
+    def _uniform_video_ttt_layer_indices(*, total_layers: int, num_ttt_layers: int) -> tuple[int, ...]:
+        if total_layers <= 0:
+            raise ValueError(f"`total_layers` must be positive, got {total_layers}.")
+        if num_ttt_layers <= 0:
+            raise ValueError(f"`num_ttt_layers` must be positive, got {num_ttt_layers}.")
+        if num_ttt_layers > total_layers:
+            raise ValueError(
+                f"`num_ttt_layers` cannot exceed transformer depth, got {num_ttt_layers} > {total_layers}."
+            )
+        return tuple(
+            min(total_layers - 1, max(0, int(float(i + 1) * total_layers / float(num_ttt_layers + 1))))
+            for i in range(num_ttt_layers)
+        )
+
     def _get_video_ttt_adapter(self) -> Optional[VideoTTTQKVAdapter]:
         adapter = getattr(self.mot, "video_ttt_adapter", None)
         if adapter is None:
@@ -233,9 +303,108 @@ class FastWAM(torch.nn.Module):
     def video_ttt_enabled(self) -> bool:
         return self._get_video_ttt_adapter() is not None
 
+    def _video_ttt_gate_metrics(self) -> dict[str, float]:
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None:
+            return {}
+        gates = adapter.residual_gate.detach().float()
+        nonzero = (gates.abs() > 1.0e-8).to(dtype=torch.float32)
+        return {
+            "video_ttt_residual_gate_mean": float(gates.mean().item()),
+            "video_ttt_residual_gate_abs_mean": float(gates.abs().mean().item()),
+            "video_ttt_residual_gate_abs_max": float(gates.abs().max().item()),
+            "video_ttt_residual_gate_nonzero_frac": float(nonzero.mean().item()),
+            "video_ttt_residual_gate_count": float(gates.numel()),
+        }
+
     def reset_video_ttt_state(self) -> None:
         """Reset inference-time fast weights at an episode/task boundary."""
         self._video_ttt_inference_state = None
+
+    @staticmethod
+    def _unpack_video_ttt_payload(payload: Any) -> tuple[Any, Any]:
+        if isinstance(payload, dict) and "tokens" in payload:
+            return payload["tokens"], payload.get("positions")
+        return payload, None
+
+    def _coerce_video_ttt_global_time(
+        self,
+        global_time: Optional[torch.Tensor | int | float],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if global_time is None:
+            return torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        if not isinstance(global_time, torch.Tensor):
+            global_time = torch.as_tensor(global_time)
+        global_time = global_time.to(device=device, dtype=torch.float32)
+        if global_time.ndim == 0:
+            return global_time.view(1).expand(batch_size)
+        if global_time.ndim == 1:
+            if global_time.shape[0] == 1:
+                return global_time.expand(batch_size)
+            if global_time.shape[0] == batch_size:
+                return global_time
+        if global_time.ndim == 2 and global_time.shape == (batch_size, 1):
+            return global_time[:, 0]
+        raise ValueError(
+            "`global_time` must be scalar or [B] matching the token batch, "
+            f"got shape {tuple(global_time.shape)} for batch_size={batch_size}."
+        )
+
+    def _offsets_to_video_ttt_global_time(self, offsets: torch.Tensor | int | float) -> torch.Tensor:
+        if not isinstance(offsets, torch.Tensor):
+            offsets = torch.as_tensor(offsets)
+        return torch.div(offsets.to(dtype=torch.long), int(self.video_ttt_time_stride), rounding_mode="floor")
+
+    def _build_video_ttt_positions(
+        self,
+        *,
+        meta: dict[str, Any],
+        batch_size: int,
+        device: torch.device,
+        global_time: Optional[torch.Tensor | int | float],
+        prefix_len: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        grid_size = meta.get("grid_size")
+        if grid_size is None or len(grid_size) != 3:
+            raise ValueError(f"Video TTT positions require `meta['grid_size']=(f,h,w)`, got {grid_size!r}.")
+        f, h, w = (int(grid_size[0]), int(grid_size[1]), int(grid_size[2]))
+        if f <= 0 or h <= 0 or w <= 0:
+            raise ValueError(f"Invalid video TTT grid size {(f, h, w)}.")
+
+        base_time = self._coerce_video_ttt_global_time(
+            global_time,
+            batch_size=batch_size,
+            device=device,
+        )
+        frame_time = base_time.view(batch_size, 1, 1, 1) + torch.arange(
+            f,
+            device=device,
+            dtype=torch.float32,
+        ).view(1, f, 1, 1)
+        video_time = frame_time.expand(batch_size, f, h, w).reshape(batch_size, f * h * w)
+        video_height = torch.arange(h, device=device, dtype=torch.float32).view(1, 1, h, 1)
+        video_height = video_height.expand(batch_size, f, h, w).reshape(batch_size, f * h * w)
+        video_width = torch.arange(w, device=device, dtype=torch.float32).view(1, 1, 1, w)
+        video_width = video_width.expand(batch_size, f, h, w).reshape(batch_size, f * h * w)
+
+        if prefix_len > 0:
+            prefix_time = torch.zeros((batch_size, prefix_len), device=device, dtype=torch.float32)
+            state_tokens = min(int(self.video_ttt_state_token_count), int(prefix_len))
+            if state_tokens > 0:
+                prefix_time[:, -state_tokens:] = base_time.view(batch_size, 1)
+            zeros = torch.zeros((batch_size, prefix_len), device=device, dtype=torch.float32)
+            video_time = torch.cat([prefix_time, video_time], dim=1)
+            video_height = torch.cat([zeros, video_height], dim=1)
+            video_width = torch.cat([zeros, video_width], dim=1)
+
+        return {
+            "time": video_time,
+            "height": video_height,
+            "width": video_width,
+        }
 
     def _apply_video_ttt_observation(
         self,
@@ -245,20 +414,441 @@ class FastWAM(torch.nn.Module):
         persist_state: bool,
         update: bool = True,
         update_tokens: Optional[torch.Tensor] = None,
+        positions: Optional[Any] = None,
+        update_positions: Optional[Any] = None,
+        layer_idx: Optional[int] = None,
+        compute_loss: bool = True,
     ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
         adapter = self._get_video_ttt_adapter()
         if adapter is None:
             return video_tokens, state, None
 
-        adapted_tokens, new_state, ttt_loss = adapter(
-            video_tokens,
-            state=state,
-            update=update,
-            update_tokens=update_tokens,
-        )
+        video_tokens, payload_positions = self._unpack_video_ttt_payload(video_tokens)
+        if payload_positions is not None:
+            positions = payload_positions
+        update_tokens, payload_update_positions = self._unpack_video_ttt_payload(update_tokens)
+        if payload_update_positions is not None:
+            update_positions = payload_update_positions
+
+        if isinstance(video_tokens, (list, tuple)):
+            token_layers = list(video_tokens)
+            if len(token_layers) <= 0:
+                raise ValueError("`video_tokens` sequence must contain at least one tensor.")
+            if isinstance(update_tokens, (list, tuple)):
+                update_layers = list(update_tokens)
+            else:
+                update_layers = token_layers if update_tokens is None else [update_tokens] * len(token_layers)
+            if isinstance(positions, (list, tuple)):
+                position_layers = list(positions)
+            else:
+                position_layers = [positions] * len(token_layers)
+            if isinstance(update_positions, (list, tuple)):
+                update_position_layers = list(update_positions)
+            else:
+                update_position_layers = position_layers if update_positions is None else [update_positions] * len(token_layers)
+            num_layers = min(len(token_layers), adapter.num_layers)
+            if len(update_layers) < num_layers:
+                raise ValueError(
+                    f"`update_tokens` sequence must have at least {num_layers} entries, got {len(update_layers)}."
+                )
+            if len(position_layers) < num_layers:
+                raise ValueError(
+                    f"`positions` sequence must have at least {num_layers} entries, got {len(position_layers)}."
+                )
+            if len(update_position_layers) < num_layers:
+                raise ValueError(
+                    "`update_positions` sequence must have at least "
+                    f"{num_layers} entries, got {len(update_position_layers)}."
+                )
+            adapted_tokens = token_layers[num_layers - 1]
+            new_state = state
+            losses = []
+            for current_layer_idx in range(num_layers):
+                adapted_tokens, new_state, ttt_loss = adapter(
+                    token_layers[current_layer_idx],
+                    state=new_state,
+                    update=update,
+                    update_tokens=update_layers[current_layer_idx],
+                    positions=position_layers[current_layer_idx],
+                    update_positions=update_position_layers[current_layer_idx],
+                    layer_idx=current_layer_idx,
+                    compute_loss=compute_loss,
+                )
+                if ttt_loss is not None:
+                    losses.append(ttt_loss)
+            ttt_loss = None if len(losses) == 0 else torch.stack(losses).mean()
+            if persist_state:
+                self._video_ttt_inference_state = adapter.detach_state(new_state)
+            return adapted_tokens, new_state, ttt_loss
+
+        layer_indices = range(adapter.num_layers) if layer_idx is None else [int(layer_idx)]
+        adapted_tokens = video_tokens
+        new_state = state
+        losses = []
+        update_token_layers = list(update_tokens) if isinstance(update_tokens, (list, tuple)) else None
+        position_layers = list(positions) if isinstance(positions, (list, tuple)) else None
+        update_position_layers = list(update_positions) if isinstance(update_positions, (list, tuple)) else None
+        for current_layer_idx in layer_indices:
+            if update_token_layers is not None:
+                if current_layer_idx >= len(update_token_layers):
+                    raise ValueError(
+                        f"`update_tokens` sequence has {len(update_token_layers)} entries, "
+                        f"but layer {current_layer_idx} was requested."
+                    )
+                update_tokens_for_layer = update_token_layers[current_layer_idx]
+            else:
+                update_tokens_for_layer = update_tokens
+            if position_layers is not None:
+                if current_layer_idx >= len(position_layers):
+                    raise ValueError(
+                        f"`positions` sequence has {len(position_layers)} entries, "
+                        f"but layer {current_layer_idx} was requested."
+                    )
+                positions_for_layer = position_layers[current_layer_idx]
+            else:
+                positions_for_layer = positions
+            if update_position_layers is not None:
+                if current_layer_idx >= len(update_position_layers):
+                    raise ValueError(
+                        f"`update_positions` sequence has {len(update_position_layers)} entries, "
+                        f"but layer {current_layer_idx} was requested."
+                    )
+                update_positions_for_layer = update_position_layers[current_layer_idx]
+            else:
+                update_positions_for_layer = update_positions
+            adapted_tokens, new_state, ttt_loss = adapter(
+                adapted_tokens,
+                state=new_state,
+                update=update,
+                update_tokens=update_tokens_for_layer,
+                positions=positions_for_layer,
+                update_positions=update_positions_for_layer,
+                layer_idx=current_layer_idx,
+                compute_loss=compute_loss,
+            )
+            if ttt_loss is not None:
+                losses.append(ttt_loss)
+        ttt_loss = None if len(losses) == 0 else torch.stack(losses).mean()
         if persist_state:
             self._video_ttt_inference_state = adapter.detach_state(new_state)
         return adapted_tokens, new_state, ttt_loss
+
+    def _update_video_ttt_observation_inline(
+        self,
+        *,
+        first_frame_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        state: Optional[dict[str, torch.Tensor]],
+        persist_state: bool,
+        global_time: Optional[torch.Tensor | int | float] = None,
+        update: bool = True,
+        compute_loss: bool = True,
+    ) -> tuple[Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None:
+            return state, None
+
+        timestep_video_obs = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        obs_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video_obs,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        prefix_tokens = obs_pre["context"] if self.video_ttt_include_context_tokens else None
+        prefix_len = 0 if prefix_tokens is None else int(prefix_tokens.shape[1])
+        positions = self._build_video_ttt_positions(
+            meta=obs_pre["meta"],
+            batch_size=int(obs_pre["tokens"].shape[0]),
+            device=obs_pre["tokens"].device,
+            global_time=global_time,
+            prefix_len=prefix_len,
+        )
+
+        def with_prefix(tokens: torch.Tensor) -> torch.Tensor:
+            if prefix_tokens is None:
+                return tokens
+            return torch.cat([prefix_tokens.to(device=tokens.device, dtype=tokens.dtype), tokens], dim=1)
+
+        selected_layers = tuple(getattr(self, "video_ttt_layer_indices", ()))
+        if len(selected_layers) <= 0:
+            observation_tokens = {
+                "tokens": with_prefix(obs_pre["tokens"]),
+                "positions": positions,
+            }
+            _, new_state, ttt_loss = self._apply_video_ttt_observation(
+                observation_tokens,
+                state=state,
+                persist_state=persist_state,
+                update=update,
+                update_tokens=observation_tokens,
+                compute_loss=compute_loss,
+            )
+            return new_state, ttt_loss
+
+        selected_layers = selected_layers[: int(adapter.num_layers)]
+        max_selected_layer = max(selected_layers)
+        x_tokens = obs_pre["tokens"]
+        self_attn_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=int(x_tokens.shape[1]),
+            video_tokens_per_frame=int(obs_pre["meta"]["tokens_per_frame"]),
+            device=x_tokens.device,
+        )
+        new_state = state
+        losses = []
+        for block_idx in range(max_selected_layer + 1):
+            block = self.video_expert.blocks[block_idx]
+            if self.video_ttt_train_backbone:
+                x_tokens = block(
+                    x_tokens,
+                    obs_pre["context"],
+                    obs_pre["t_mod"],
+                    obs_pre["freqs"],
+                    context_mask=obs_pre["context_mask"],
+                    self_attn_mask=self_attn_mask,
+                )
+            else:
+                with torch.no_grad():
+                    x_tokens = block(
+                        x_tokens,
+                        obs_pre["context"],
+                        obs_pre["t_mod"],
+                        obs_pre["freqs"],
+                        context_mask=obs_pre["context_mask"],
+                        self_attn_mask=self_attn_mask,
+                    )
+            slot_idx = self.video_ttt_layer_to_slot.get(int(block_idx))
+            if slot_idx is None:
+                continue
+            adapted_tokens, new_state, ttt_loss = adapter(
+                with_prefix(x_tokens),
+                state=new_state,
+                update=update,
+                update_tokens=None,
+                positions=positions,
+                layer_idx=int(slot_idx),
+                compute_loss=compute_loss,
+            )
+            if ttt_loss is not None:
+                losses.append(ttt_loss)
+            x_tokens = adapted_tokens[:, prefix_len:].contiguous() if prefix_len > 0 else adapted_tokens
+
+        if persist_state:
+            self._video_ttt_inference_state = adapter.detach_state(new_state)
+        ttt_loss = None if len(losses) == 0 else torch.stack(losses).mean()
+        return new_state, ttt_loss
+
+    def _training_loss_video_ttt_switch_chunk_group(
+        self,
+        *,
+        state: Optional[dict[str, torch.Tensor]],
+        frames: torch.Tensor,
+        proprios: torch.Tensor,
+        mask: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        tiled: bool = False,
+        global_times: Optional[torch.Tensor] = None,
+    ) -> tuple[Optional[dict[str, torch.Tensor]], torch.Tensor, int]:
+        """Batched observe prefill with serial-equivalent per-frame TTT updates."""
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None or not self.video_ttt_uses_layer_hook:
+            return state, frames.new_tensor(0.0, dtype=torch.float32), 0
+        if self.video_ttt_train_backbone:
+            raise ValueError("Grouped observe prefill is only enabled for frozen video backbone training.")
+        if frames.ndim != 5:
+            raise ValueError(f"`frames` must be [B,G,3,H,W], got {tuple(frames.shape)}.")
+        if proprios.ndim != 3:
+            raise ValueError(f"`proprios` must be [B,G,D], got {tuple(proprios.shape)}.")
+        if mask.ndim != 2 or mask.shape[:2] != frames.shape[:2]:
+            raise ValueError(f"`mask` must be [B,G] matching frames, got {tuple(mask.shape)}.")
+
+        batch_size, group_size = int(frames.shape[0]), int(frames.shape[1])
+        mask = mask.to(device=frames.device, dtype=torch.bool)
+        if not bool(mask.any().item()):
+            return state, frames.new_tensor(0.0, dtype=torch.float32), 0
+
+        pair_sample_indices = []
+        pair_step_indices = []
+        step_pair_indices: list[torch.Tensor] = []
+        for step_idx in range(group_size):
+            valid_indices = torch.nonzero(mask[:, step_idx], as_tuple=False).flatten()
+            step_pair_indices.append(
+                torch.arange(
+                    sum(int(x.numel()) for x in pair_sample_indices),
+                    sum(int(x.numel()) for x in pair_sample_indices) + int(valid_indices.numel()),
+                    device=frames.device,
+                    dtype=torch.long,
+                )
+            )
+            if valid_indices.numel() == 0:
+                continue
+            pair_sample_indices.append(valid_indices)
+            pair_step_indices.append(torch.full_like(valid_indices, int(step_idx)))
+
+        if not pair_sample_indices:
+            return state, frames.new_tensor(0.0, dtype=torch.float32), 0
+        pair_sample = torch.cat(pair_sample_indices, dim=0).to(device=frames.device)
+        pair_step = torch.cat(pair_step_indices, dim=0).to(device=frames.device)
+        flat_frames = frames[pair_sample, pair_step].unsqueeze(2)
+        first_frame_latents = self._encode_video_latents(flat_frames, tiled=tiled)
+
+        flat_context = context.index_select(0, pair_sample)
+        flat_context_mask = context_mask.index_select(0, pair_sample)
+        if self.proprio_encoder is not None:
+            flat_context, flat_context_mask = self._append_proprio_to_context(
+                context=flat_context,
+                context_mask=flat_context_mask,
+                proprio=proprios[pair_sample, pair_step],
+            )
+
+        flat_global_time = None
+        if isinstance(global_times, torch.Tensor):
+            flat_global_time = global_times.to(device=frames.device).index_select(0, pair_sample)
+            flat_global_time = flat_global_time.gather(1, pair_step.view(-1, 1)).flatten()
+
+        timestep_video_obs = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        obs_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video_obs,
+            context=flat_context,
+            context_mask=flat_context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        prefix_tokens = obs_pre["context"] if self.video_ttt_include_context_tokens else None
+        prefix_len = 0 if prefix_tokens is None else int(prefix_tokens.shape[1])
+        positions = self._build_video_ttt_positions(
+            meta=obs_pre["meta"],
+            batch_size=int(obs_pre["tokens"].shape[0]),
+            device=obs_pre["tokens"].device,
+            global_time=flat_global_time,
+            prefix_len=prefix_len,
+        )
+
+        def with_prefix(tokens: torch.Tensor, pair_indices: torch.Tensor) -> torch.Tensor:
+            selected = tokens.index_select(0, pair_indices)
+            if prefix_tokens is None:
+                return selected
+            selected_prefix = prefix_tokens.index_select(0, pair_indices).to(
+                device=selected.device,
+                dtype=selected.dtype,
+            )
+            return torch.cat([selected_prefix, selected], dim=1)
+
+        def select_positions(pair_indices: torch.Tensor) -> dict[str, torch.Tensor]:
+            return {
+                key: value.index_select(0, pair_indices.to(device=value.device))
+                for key, value in positions.items()
+            }
+
+        selected_layers = tuple(getattr(self, "video_ttt_layer_indices", ()))
+        selected_layers = selected_layers[: int(adapter.num_layers)]
+        if len(selected_layers) <= 0:
+            return state, frames.new_tensor(0.0, dtype=torch.float32), 0
+
+        max_selected_layer = max(selected_layers)
+        x_tokens = obs_pre["tokens"]
+        self_attn_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=int(x_tokens.shape[1]),
+            video_tokens_per_frame=int(obs_pre["meta"]["tokens_per_frame"]),
+            device=x_tokens.device,
+        )
+        loss_sums: list[Optional[torch.Tensor]] = [None for _ in range(group_size)]
+        loss_layer_counts = [0 for _ in range(group_size)]
+        valid_counts = [int(mask[:, idx].sum().item()) for idx in range(group_size)]
+
+        for block_idx in range(max_selected_layer + 1):
+            block = self.video_expert.blocks[block_idx]
+            with torch.no_grad():
+                x_tokens = block(
+                    x_tokens,
+                    obs_pre["context"],
+                    obs_pre["t_mod"],
+                    obs_pre["freqs"],
+                    context_mask=obs_pre["context_mask"],
+                    self_attn_mask=self_attn_mask,
+                )
+            slot_idx = self.video_ttt_layer_to_slot.get(int(block_idx))
+            if slot_idx is None:
+                continue
+
+            for step_idx, pair_indices in enumerate(step_pair_indices):
+                if pair_indices.numel() == 0:
+                    continue
+                pair_indices = pair_indices.to(device=x_tokens.device)
+                valid_indices_device = pair_sample.index_select(0, pair_indices).to(device=self.device)
+                sub_state = self._select_video_ttt_state(state, valid_indices_device)
+                adapted_tokens, sub_state, ttt_loss = adapter(
+                    with_prefix(x_tokens, pair_indices),
+                    state=sub_state,
+                    update=True,
+                    update_tokens=None,
+                    positions=select_positions(pair_indices),
+                    layer_idx=int(slot_idx),
+                    compute_loss=True,
+                )
+                suffix = adapted_tokens[:, prefix_len:].contiguous() if prefix_len > 0 else adapted_tokens
+                x_tokens = x_tokens.index_copy(0, pair_indices, suffix).detach()
+                state = self._scatter_video_ttt_state(state, sub_state, valid_indices_device)
+                if ttt_loss is not None:
+                    loss_sums[step_idx] = ttt_loss if loss_sums[step_idx] is None else loss_sums[step_idx] + ttt_loss
+                    loss_layer_counts[step_idx] += 1
+
+        weighted_loss_sum = frames.new_tensor(0.0, dtype=torch.float32)
+        loss_count = 0
+        for step_idx, loss_sum in enumerate(loss_sums):
+            if loss_sum is None or loss_layer_counts[step_idx] <= 0:
+                continue
+            weighted_loss_sum = weighted_loss_sum + (loss_sum / float(loss_layer_counts[step_idx])) * float(
+                valid_counts[step_idx]
+            )
+            loss_count += valid_counts[step_idx]
+        return state, weighted_loss_sum, int(loss_count)
+
+    def _build_video_ttt_layer_hook(
+        self,
+        *,
+        state: Optional[dict[str, torch.Tensor]] = None,
+        positions: Optional[dict[str, torch.Tensor]] = None,
+    ) -> Optional[Callable[[int, torch.Tensor], torch.Tensor]]:
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None:
+            return None
+        hook_state = self._video_ttt_inference_state if state is None else state
+
+        def hook(layer_idx: int, tokens: torch.Tensor) -> torch.Tensor:
+            if not self.video_ttt_uses_layer_hook:
+                return tokens
+            slot_idx = self.video_ttt_layer_to_slot.get(int(layer_idx))
+            if slot_idx is None:
+                return tokens
+            adapted_tokens, _, _ = self._apply_video_ttt_observation(
+                tokens,
+                state=hook_state,
+                persist_state=False,
+                update=False,
+                update_tokens=None,
+                positions=positions,
+                layer_idx=int(slot_idx),
+                compute_loss=False,
+            )
+            return adapted_tokens
+
+        return hook
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -354,6 +944,8 @@ class FastWAM(torch.nn.Module):
             )
         context = sample["context"]
         context_mask = sample["context_mask"]
+        observation_context = sample.get("observation_context", None)
+        observation_context_mask = sample.get("observation_context_mask", None)
         proprio = sample.get("proprio", None)
         if video.ndim != 5:
             raise ValueError(f"`sample['video']` must be 5D [B, 3, T, H, W], got shape {tuple(video.shape)}")
@@ -421,6 +1013,25 @@ class FastWAM(torch.nn.Module):
             )
         context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if observation_context is not None or observation_context_mask is not None:
+            if observation_context is None or observation_context_mask is None:
+                raise ValueError("`observation_context` and `observation_context_mask` must be provided together.")
+            if observation_context.ndim != 3 or observation_context_mask.ndim != 2:
+                raise ValueError(
+                    "`observation_context/observation_context_mask` must be [B,L,D]/[B,L], "
+                    f"got {tuple(observation_context.shape)} and {tuple(observation_context_mask.shape)}"
+                )
+            if observation_context.shape[0] != batch_size or observation_context_mask.shape[0] != batch_size:
+                raise ValueError(
+                    "`observation_context` batch size must match video batch size, "
+                    f"got {observation_context.shape[0]} and {batch_size}."
+                )
+            observation_context = observation_context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            observation_context_mask = observation_context_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("`sample['proprio']` is required when `proprio_dim` is enabled.")
@@ -436,6 +1047,12 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
             )
+            if observation_context is not None and observation_context_mask is not None:
+                observation_context, observation_context_mask = self._append_proprio_to_context(
+                    context=observation_context,
+                    context_mask=observation_context_mask,
+                    proprio=proprio.to(device=self.device, dtype=self.torch_dtype),
+                )
         action = action.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         restart_context = sample.get("restart_context", None)
@@ -471,10 +1088,17 @@ class FastWAM(torch.nn.Module):
             action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if image_is_pad is not None:
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        ttt_global_time = sample.get("ttt_global_time", None)
+        if ttt_global_time is None and "ttt_offset" in sample:
+            ttt_global_time = self._offsets_to_video_ttt_global_time(sample["ttt_offset"])
+        if isinstance(ttt_global_time, torch.Tensor):
+            ttt_global_time = ttt_global_time.to(device=self.device, dtype=torch.long, non_blocking=True)
 
         return {
             "context": context,
             "context_mask": context_mask,
+            "observation_context": observation_context,
+            "observation_context_mask": observation_context_mask,
             "input_latents": input_latents,
             "first_frame_latents": first_frame_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
@@ -485,6 +1109,7 @@ class FastWAM(torch.nn.Module):
             "restart_context_mask": restart_context_mask,
             "video_height": height,
             "video_width": width,
+            "ttt_global_time": ttt_global_time,
         }
 
     @torch.no_grad()
@@ -557,7 +1182,8 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
-    ) -> torch.Tensor:
+        global_time: Optional[torch.Tensor | int | float] = None,
+    ) -> dict[str, Any]:
         timestep_video_obs = torch.zeros(
             (first_frame_latents.shape[0],),
             dtype=first_frame_latents.dtype,
@@ -571,7 +1197,74 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
         )
-        return obs_pre["tokens"]
+        prefix_tokens = obs_pre["context"] if self.video_ttt_include_context_tokens else None
+        prefix_len = 0 if prefix_tokens is None else int(prefix_tokens.shape[1])
+        positions = self._build_video_ttt_positions(
+            meta=obs_pre["meta"],
+            batch_size=int(obs_pre["tokens"].shape[0]),
+            device=obs_pre["tokens"].device,
+            global_time=global_time,
+            prefix_len=prefix_len,
+        )
+
+        def add_prefix(tokens: torch.Tensor) -> torch.Tensor:
+            if prefix_tokens is None:
+                return tokens
+            return torch.cat([prefix_tokens.to(device=tokens.device, dtype=tokens.dtype), tokens], dim=1)
+
+        selected_layers = tuple(getattr(self, "video_ttt_layer_indices", ()))
+        if len(selected_layers) <= 0:
+            return {
+                "tokens": add_prefix(obs_pre["tokens"]),
+                "positions": positions,
+            }
+        adapter = self._get_video_ttt_adapter()
+        if adapter is None:
+            return {
+                "tokens": add_prefix(obs_pre["tokens"]),
+                "positions": positions,
+            }
+        selected_layers = selected_layers[: int(adapter.num_layers)]
+        max_selected_layer = max(selected_layers)
+
+        x_tokens = obs_pre["tokens"]
+        self_attn_mask = self.video_expert.build_video_to_video_mask(
+            video_seq_len=int(x_tokens.shape[1]),
+            video_tokens_per_frame=int(obs_pre["meta"]["tokens_per_frame"]),
+            device=x_tokens.device,
+        )
+        layer_tokens: list[Optional[torch.Tensor]] = [None] * int(adapter.num_layers)
+        for block_idx in range(max_selected_layer + 1):
+            block = self.video_expert.blocks[block_idx]
+            if self.video_ttt_train_backbone:
+                x_tokens = block(
+                    x_tokens,
+                    obs_pre["context"],
+                    obs_pre["t_mod"],
+                    obs_pre["freqs"],
+                    context_mask=obs_pre["context_mask"],
+                    self_attn_mask=self_attn_mask,
+                )
+            else:
+                with torch.no_grad():
+                    x_tokens = block(
+                        x_tokens,
+                        obs_pre["context"],
+                        obs_pre["t_mod"],
+                        obs_pre["freqs"],
+                        context_mask=obs_pre["context_mask"],
+                        self_attn_mask=self_attn_mask,
+                    )
+            slot_idx = self.video_ttt_layer_to_slot.get(int(block_idx))
+            if slot_idx is not None and slot_idx < len(layer_tokens):
+                layer_tokens[slot_idx] = add_prefix(x_tokens)
+        if any(token is None for token in layer_tokens):
+            raise RuntimeError(f"Failed to collect all video TTT layer tokens for layers {selected_layers}.")
+        token_layers = [token for token in layer_tokens if token is not None]
+        return {
+            "tokens": token_layers,
+            "positions": [positions] * len(token_layers),
+        }
 
     def _training_loss_video_ttt_one_chunk(
         self,
@@ -583,12 +1276,19 @@ class FastWAM(torch.nn.Module):
         batch_size = input_latents.shape[0]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        observation_context = inputs.get("observation_context")
+        observation_context_mask = inputs.get("observation_context_mask")
+        if observation_context is None:
+            observation_context = context
+        if observation_context_mask is None:
+            observation_context_mask = context_mask
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
         first_frame_latents = inputs["first_frame_latents"]
         if first_frame_latents is None:
             first_frame_latents = input_latents[:, :, 0:1]
+        ttt_global_time = inputs.get("ttt_global_time", None)
 
         noise_video = torch.randn_like(input_latents)
         timestep_video = self.train_video_scheduler.sample_training_t(
@@ -610,12 +1310,6 @@ class FastWAM(torch.nn.Module):
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-        observation_tokens = self._build_video_ttt_observation_tokens(
-            first_frame_latents=first_frame_latents,
-            context=context,
-            context_mask=context_mask,
-            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
-        )
         video_pre = self.video_expert.pre_dit(
             x=latents,
             timestep=timestep_video,
@@ -624,15 +1318,43 @@ class FastWAM(torch.nn.Module):
             action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
-        video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
-            video_pre["tokens"],
-            state=state,
-            persist_state=False,
-            update=True,
-            update_tokens=observation_tokens,
+        video_ttt_positions = self._build_video_ttt_positions(
+            meta=video_pre["meta"],
+            batch_size=int(video_pre["tokens"].shape[0]),
+            device=video_pre["tokens"].device,
+            global_time=ttt_global_time,
+            prefix_len=0,
         )
-        video_pre = dict(video_pre)
-        video_pre["tokens"] = video_tokens
+        if self.video_ttt_uses_layer_hook:
+            state, ttt_loss = self._update_video_ttt_observation_inline(
+                first_frame_latents=first_frame_latents,
+                context=observation_context,
+                context_mask=observation_context_mask,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                state=state,
+                persist_state=False,
+                update=True,
+                global_time=ttt_global_time,
+            )
+            video_tokens = video_pre["tokens"]
+            video_ttt_hook = self._build_video_ttt_layer_hook(state=state, positions=video_ttt_positions)
+        else:
+            observation_tokens = self._build_video_ttt_observation_tokens(
+                first_frame_latents=first_frame_latents,
+                context=observation_context,
+                context_mask=observation_context_mask,
+                fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                global_time=ttt_global_time,
+            )
+            video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
+                video_pre["tokens"],
+                state=state,
+                persist_state=False,
+                update=True,
+                update_tokens=observation_tokens,
+                positions=video_ttt_positions,
+            )
+            video_ttt_hook = None
 
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
@@ -671,6 +1393,7 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            video_ttt_hook=video_ttt_hook,
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -718,12 +1441,25 @@ class FastWAM(torch.nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
+        global_time: Optional[torch.Tensor | int | float] = None,
     ) -> tuple[Optional[dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+        if self.video_ttt_uses_layer_hook:
+            return self._update_video_ttt_observation_inline(
+                first_frame_latents=first_frame_latents,
+                context=context,
+                context_mask=context_mask,
+                fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+                state=state,
+                persist_state=False,
+                update=True,
+                global_time=global_time,
+            )
         switch_tokens = self._build_video_ttt_observation_tokens(
             first_frame_latents=first_frame_latents,
             context=context,
             context_mask=context_mask,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            global_time=global_time,
         )
         _, state, ttt_switch_loss = self._apply_video_ttt_observation(
             switch_tokens,
@@ -743,6 +1479,8 @@ class FastWAM(torch.nn.Module):
             "proprio",
             "context",
             "context_mask",
+            "observation_context",
+            "observation_context_mask",
             "image_is_pad",
             "action_is_pad",
             "proprio_is_pad",
@@ -792,6 +1530,8 @@ class FastWAM(torch.nn.Module):
         base_keys = {
             "context",
             "context_mask",
+            "observation_context",
+            "observation_context_mask",
             "restart_context",
             "restart_context_mask",
         }
@@ -811,6 +1551,14 @@ class FastWAM(torch.nn.Module):
             value = sample.get(seq_key)
             if isinstance(value, torch.Tensor):
                 sliced[out_key] = value.index_select(0, indices)[:, chunk_idx]
+        meta_sequence_keys = {
+            "ttt_offset": "ttt_execution_offsets",
+            "ttt_global_time": "ttt_execution_times",
+        }
+        for out_key, seq_key in meta_sequence_keys.items():
+            value = sample.get(seq_key)
+            if isinstance(value, torch.Tensor):
+                sliced[out_key] = value.index_select(0, indices)[:, chunk_idx]
         return sliced
 
     @staticmethod
@@ -821,7 +1569,7 @@ class FastWAM(torch.nn.Module):
         indices: torch.Tensor,
     ) -> dict[str, Any]:
         sliced: dict[str, Any] = {}
-        for key in ("context", "context_mask"):
+        for key in ("context", "context_mask", "observation_context", "observation_context_mask"):
             value = sample.get(key)
             if isinstance(value, torch.Tensor):
                 selected = value.index_select(0, indices)
@@ -1106,14 +1854,58 @@ class FastWAM(torch.nn.Module):
             raise ValueError(f"`ttt_warmup_video` must be [B,N,3,H,W], got {tuple(warmup_video.shape)}.")
         if warmup_video.shape[2] != 3:
             raise ValueError(f"`ttt_warmup_video` channel dim must be 3, got {warmup_video.shape[2]}.")
+        warmup_mask = sample.get("ttt_warmup_mask")
+        if isinstance(warmup_mask, torch.Tensor):
+            warmup_mask = warmup_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            if warmup_mask.ndim != 2 or warmup_mask.shape[:2] != warmup_video.shape[:2]:
+                raise ValueError(
+                    "`ttt_warmup_mask` must be [B,N] matching `ttt_warmup_video`, "
+                    f"got {tuple(warmup_mask.shape)} vs {tuple(warmup_video.shape[:2])}."
+                )
+        else:
+            warmup_mask = torch.ones(
+                warmup_video.shape[:2],
+                device=self.device,
+                dtype=torch.bool,
+            )
+        warmup_times = sample.get("ttt_warmup_times", None)
+        if warmup_times is None and isinstance(sample.get("ttt_warmup_offsets"), torch.Tensor):
+            warmup_times = self._offsets_to_video_ttt_global_time(sample["ttt_warmup_offsets"])
+        if isinstance(warmup_times, torch.Tensor):
+            warmup_times = warmup_times.to(device=self.device, dtype=torch.long, non_blocking=True)
 
         context = sample["context"].to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
         context_mask = sample["context_mask"].to(device=self.device, dtype=torch.bool, non_blocking=True)
+        observation_context = sample.get("observation_context")
+        observation_context_mask = sample.get("observation_context_mask")
+        if isinstance(observation_context, torch.Tensor) and isinstance(observation_context_mask, torch.Tensor):
+            observation_context = observation_context.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+            observation_context_mask = observation_context_mask.to(
+                device=self.device,
+                dtype=torch.bool,
+                non_blocking=True,
+            )
+        else:
+            observation_context = context
+            observation_context_mask = context_mask
         state = None
         ttt_loss_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
         ttt_loss_count = 0
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
         streaming_backward = backward_fn is not None
+        observe_prefill_group_size = int(getattr(self, "video_ttt_observe_prefill_group_size", 1))
+        execution_backward_group_size = int(getattr(self, "video_ttt_execution_backward_group_size", 1))
+        use_grouped_observe_prefill = (
+            observe_prefill_group_size > 1
+            and self.video_ttt_uses_layer_hook
+            and not self.video_ttt_train_backbone
+        )
+        outer_backward_group_count = 0
+        outer_backward_chunk_count = 0
 
         execution_count_expected = int(warmup_video.shape[0])
         execution_mask_for_counts = sample.get("ttt_execution_mask")
@@ -1121,38 +1913,87 @@ class FastWAM(torch.nn.Module):
             execution_count_expected = int(execution_mask_for_counts.bool().sum().item())
         if execution_count_expected <= 0:
             raise ValueError("Observe-then-act TTT found no valid execution chunks.")
-        warmup_count_expected = int(warmup_video.shape[0] * warmup_video.shape[1])
-        ttt_loss_count_expected = max(warmup_count_expected + execution_count_expected, 1)
+        warmup_count_expected = int(warmup_mask.sum().item())
+        if warmup_count_expected <= 0:
+            raise ValueError("Observe-then-act TTT found no valid warmup chunks.")
+        policy_update_count_expected = 0
+        policy_update_mask_for_counts = sample.get("ttt_policy_update_mask")
+        if isinstance(sample.get("ttt_policy_update_video"), torch.Tensor) and isinstance(
+            policy_update_mask_for_counts,
+            torch.Tensor,
+        ):
+            policy_update_count_expected = int(policy_update_mask_for_counts.bool().sum().item())
+        ttt_loss_count_expected = max(
+            warmup_count_expected + execution_count_expected + policy_update_count_expected,
+            1,
+        )
 
-        for chunk_idx in range(int(warmup_video.shape[1])):
-            frame = warmup_video[:, chunk_idx].unsqueeze(2)
-            first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
-            obs_context = context
-            obs_context_mask = context_mask
-            if self.proprio_encoder is not None:
-                obs_context, obs_context_mask = self._append_proprio_to_context(
+        if use_grouped_observe_prefill:
+            chunk_idx = 0
+            while chunk_idx < int(warmup_video.shape[1]):
+                chunk_end = min(chunk_idx + observe_prefill_group_size, int(warmup_video.shape[1]))
+                state, ttt_loss_sum, group_ttt_count = self._training_loss_video_ttt_switch_chunk_group(
+                    state=state,
+                    frames=warmup_video[:, chunk_idx:chunk_end],
+                    proprios=warmup_proprio[:, chunk_idx:chunk_end],
+                    mask=warmup_mask[:, chunk_idx:chunk_end],
+                    context=observation_context,
+                    context_mask=observation_context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    tiled=tiled,
+                    global_times=warmup_times[:, chunk_idx:chunk_end] if isinstance(warmup_times, torch.Tensor) else None,
+                )
+                if group_ttt_count > 0:
+                    if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                        backward_fn(
+                            self.loss_lambda_video_ttt * ttt_loss_sum / float(ttt_loss_count_expected),
+                            retain_graph=True,
+                        )
+                    ttt_loss_for_total = ttt_loss_sum.detach() if streaming_backward else ttt_loss_sum
+                    ttt_loss_total = ttt_loss_total + ttt_loss_for_total
+                    ttt_loss_count += int(group_ttt_count)
+                chunk_idx = chunk_end
+        else:
+            for chunk_idx in range(int(warmup_video.shape[1])):
+                valid_indices = torch.nonzero(warmup_mask[:, chunk_idx], as_tuple=False).flatten()
+                if valid_indices.numel() == 0:
+                    continue
+                valid_indices_device = valid_indices.to(device=self.device)
+                frame = warmup_video.index_select(0, valid_indices_device)[:, chunk_idx].unsqueeze(2)
+                first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
+                obs_context = observation_context.index_select(0, valid_indices_device)
+                obs_context_mask = observation_context_mask.index_select(0, valid_indices_device)
+                if self.proprio_encoder is not None:
+                    obs_context, obs_context_mask = self._append_proprio_to_context(
+                        context=obs_context,
+                        context_mask=obs_context_mask,
+                        proprio=warmup_proprio.index_select(0, valid_indices_device)[:, chunk_idx],
+                    )
+                sub_state = self._select_video_ttt_state(state, valid_indices_device)
+                global_time = None
+                if isinstance(warmup_times, torch.Tensor):
+                    global_time = warmup_times.index_select(0, valid_indices_device)[:, chunk_idx]
+                sub_state, ttt_loss = self._training_loss_video_ttt_switch_chunk(
+                    state=sub_state,
+                    first_frame_latents=first_frame_latents,
                     context=obs_context,
                     context_mask=obs_context_mask,
-                    proprio=warmup_proprio[:, chunk_idx],
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    global_time=global_time,
                 )
-            state, ttt_loss = self._training_loss_video_ttt_switch_chunk(
-                state=state,
-                first_frame_latents=first_frame_latents,
-                context=obs_context,
-                context_mask=obs_context_mask,
-                fuse_vae_embedding_in_latents=fuse_flag,
-            )
-            if ttt_loss is not None:
-                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
-                    backward_fn(
-                        self.loss_lambda_video_ttt
-                        * ttt_loss
-                        * (float(warmup_video.shape[0]) / float(ttt_loss_count_expected)),
-                        retain_graph=True,
-                    )
-                ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
-                ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(warmup_video.shape[0])
-                ttt_loss_count += int(warmup_video.shape[0])
+                valid_count = int(valid_indices.numel())
+                if ttt_loss is not None:
+                    if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                        backward_fn(
+                            self.loss_lambda_video_ttt
+                            * ttt_loss
+                            * (float(valid_count) / float(ttt_loss_count_expected)),
+                            retain_graph=True,
+                        )
+                    ttt_loss_for_total = ttt_loss.detach() if streaming_backward else ttt_loss
+                    ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_count)
+                    ttt_loss_count += valid_count
+                state = self._scatter_video_ttt_state(state, sub_state, valid_indices_device)
 
         if "ttt_execution_video" in sample:
             execution_video = sample["ttt_execution_video"]
@@ -1175,10 +2016,137 @@ class FastWAM(torch.nn.Module):
             loss_action_total = warmup_video.new_tensor(0.0, dtype=torch.float32)
             valid_count_total = 0
             execution_mask = execution_mask.bool()
+            policy_update_video = sample.get("ttt_policy_update_video")
+            policy_update_proprio = sample.get("ttt_policy_update_proprio")
+            policy_update_mask = sample.get("ttt_policy_update_mask")
+            policy_update_times = sample.get("ttt_policy_update_times")
+            if policy_update_times is None and isinstance(sample.get("ttt_policy_update_offsets"), torch.Tensor):
+                policy_update_times = self._offsets_to_video_ttt_global_time(sample["ttt_policy_update_offsets"])
+            updates_per_execution_chunk = 0
+            raw_updates_per_chunk = sample.get("ttt_policy_updates_per_execution_chunk")
+            if isinstance(raw_updates_per_chunk, torch.Tensor):
+                updates_per_execution_chunk = int(raw_updates_per_chunk.flatten()[0].item())
+            if isinstance(policy_update_video, torch.Tensor):
+                policy_update_video = policy_update_video.to(
+                    device=self.device,
+                    dtype=self.torch_dtype,
+                    non_blocking=True,
+                )
+            if isinstance(policy_update_proprio, torch.Tensor):
+                policy_update_proprio = policy_update_proprio.to(
+                    device=self.device,
+                    dtype=self.torch_dtype,
+                    non_blocking=True,
+                )
+            if isinstance(policy_update_mask, torch.Tensor):
+                policy_update_mask = policy_update_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            if isinstance(policy_update_times, torch.Tensor):
+                policy_update_times = policy_update_times.to(device=self.device, dtype=torch.long, non_blocking=True)
             valid_count_total_expected = int(execution_mask.sum().item())
             if valid_count_total_expected <= 0:
                 raise ValueError("Sequential observe-then-act TTT found no valid execution chunks.")
+            pending_outer_backward_loss: Optional[torch.Tensor] = None
+            pending_outer_backward_chunks = 0
+
+            def flush_pending_outer_backward() -> None:
+                nonlocal pending_outer_backward_loss
+                nonlocal pending_outer_backward_chunks
+                nonlocal outer_backward_group_count
+                nonlocal outer_backward_chunk_count
+                if pending_outer_backward_loss is None:
+                    return
+                if backward_fn is None:
+                    raise RuntimeError("Cannot flush pending outer backward loss without `backward_fn`.")
+                backward_fn(pending_outer_backward_loss, retain_graph=True)
+                outer_backward_group_count += 1
+                outer_backward_chunk_count += int(pending_outer_backward_chunks)
+                pending_outer_backward_loss = None
+                pending_outer_backward_chunks = 0
+
             for chunk_idx in range(int(execution_video.shape[1])):
+                if (
+                    chunk_idx > 0
+                    and updates_per_execution_chunk > 0
+                    and isinstance(policy_update_video, torch.Tensor)
+                    and isinstance(policy_update_proprio, torch.Tensor)
+                    and isinstance(policy_update_mask, torch.Tensor)
+                ):
+                    update_start = int((chunk_idx - 1) * updates_per_execution_chunk)
+                    update_end = min(update_start + int(updates_per_execution_chunk), int(policy_update_video.shape[1]))
+                    if use_grouped_observe_prefill:
+                        group_start = update_start
+                        while group_start < update_end:
+                            group_end = min(group_start + observe_prefill_group_size, update_end)
+                            state, ttt_loss_sum, group_ttt_count = self._training_loss_video_ttt_switch_chunk_group(
+                                state=state,
+                                frames=policy_update_video[:, group_start:group_end],
+                                proprios=policy_update_proprio[:, group_start:group_end],
+                                mask=policy_update_mask[:, group_start:group_end],
+                                context=observation_context,
+                                context_mask=observation_context_mask,
+                                fuse_vae_embedding_in_latents=fuse_flag,
+                                tiled=tiled,
+                                global_times=(
+                                    policy_update_times[:, group_start:group_end]
+                                    if isinstance(policy_update_times, torch.Tensor)
+                                    else None
+                                ),
+                            )
+                            if group_ttt_count > 0:
+                                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                                    backward_fn(
+                                        self.loss_lambda_video_ttt * ttt_loss_sum / float(ttt_loss_count_expected),
+                                        retain_graph=True,
+                                    )
+                                ttt_loss_for_total = ttt_loss_sum.detach() if streaming_backward else ttt_loss_sum
+                                ttt_loss_total = ttt_loss_total + ttt_loss_for_total
+                                ttt_loss_count += int(group_ttt_count)
+                            group_start = group_end
+                    else:
+                        for update_idx in range(update_start, update_end):
+                            update_indices = torch.nonzero(
+                                policy_update_mask[:, update_idx],
+                                as_tuple=False,
+                            ).flatten()
+                            if update_indices.numel() == 0:
+                                continue
+                            update_indices_device = update_indices.to(device=self.device)
+                            frame = policy_update_video.index_select(0, update_indices_device)[:, update_idx].unsqueeze(2)
+                            first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
+                            obs_context = observation_context.index_select(0, update_indices_device)
+                            obs_context_mask = observation_context_mask.index_select(0, update_indices_device)
+                            if self.proprio_encoder is not None:
+                                obs_context, obs_context_mask = self._append_proprio_to_context(
+                                    context=obs_context,
+                                    context_mask=obs_context_mask,
+                                    proprio=policy_update_proprio.index_select(0, update_indices_device)[:, update_idx],
+                                )
+                            sub_state = self._select_video_ttt_state(state, update_indices_device)
+                            global_time = None
+                            if isinstance(policy_update_times, torch.Tensor):
+                                global_time = policy_update_times.index_select(0, update_indices_device)[:, update_idx]
+                            sub_state, ttt_update_loss = self._training_loss_video_ttt_switch_chunk(
+                                state=sub_state,
+                                first_frame_latents=first_frame_latents,
+                                context=obs_context,
+                                context_mask=obs_context_mask,
+                                fuse_vae_embedding_in_latents=fuse_flag,
+                                global_time=global_time,
+                            )
+                            valid_update_count = int(update_indices.numel())
+                            if ttt_update_loss is not None:
+                                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                                    backward_fn(
+                                        self.loss_lambda_video_ttt
+                                        * ttt_update_loss
+                                        * (float(valid_update_count) / float(ttt_loss_count_expected)),
+                                        retain_graph=True,
+                                    )
+                                ttt_loss_for_total = ttt_update_loss.detach() if streaming_backward else ttt_update_loss
+                                ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_update_count)
+                                ttt_loss_count += valid_update_count
+                            state = self._scatter_video_ttt_state(state, sub_state, update_indices_device)
+
                 valid_indices = torch.nonzero(execution_mask[:, chunk_idx], as_tuple=False).flatten()
                 if valid_indices.numel() == 0:
                     continue
@@ -1198,7 +2166,14 @@ class FastWAM(torch.nn.Module):
                         loss_for_backward = loss_for_backward + self.loss_lambda_video_ttt * ttt_loss * (
                             float(valid_count) / float(ttt_loss_count_expected)
                         )
-                    backward_fn(loss_for_backward, retain_graph=True)
+                    pending_outer_backward_loss = (
+                        loss_for_backward
+                        if pending_outer_backward_loss is None
+                        else pending_outer_backward_loss + loss_for_backward
+                    )
+                    pending_outer_backward_chunks += 1
+                    if pending_outer_backward_chunks >= execution_backward_group_size:
+                        flush_pending_outer_backward()
                 loss_outer_for_total = loss_outer.detach() if streaming_backward else loss_outer
                 loss_video_for_total = loss_video.detach() if streaming_backward else loss_video
                 loss_action_for_total = loss_action.detach() if streaming_backward else loss_action
@@ -1215,6 +2190,8 @@ class FastWAM(torch.nn.Module):
                     sub_state,
                     valid_indices.to(device=self.device),
                 )
+            if streaming_backward:
+                flush_pending_outer_backward()
             if valid_count_total <= 0:
                 raise ValueError("Sequential observe-then-act TTT found no valid execution chunks.")
             loss_total = loss_total / float(valid_count_total)
@@ -1249,10 +2226,19 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_video_ttt": float(loss_video_ttt.detach().item()),
-            "video_ttt_observe_chunks": float(warmup_video.shape[1]),
+            "video_ttt_observe_chunks": float(warmup_mask.to(dtype=torch.float32).sum(dim=1).mean().item()),
             "video_ttt_act_chunks": float(valid_chunks_per_sample.detach().mean().item()),
+            "video_ttt_policy_update_chunks": float(
+                policy_update_mask_for_counts.bool().to(dtype=torch.float32).sum(dim=1).mean().item()
+                if isinstance(policy_update_mask_for_counts, torch.Tensor)
+                else 0.0
+            ),
             "video_ttt_switch_chunks": 0.0,
+            "video_ttt_execution_backward_group_size": float(execution_backward_group_size),
+            "video_ttt_outer_backward_groups": float(outer_backward_group_count),
+            "video_ttt_outer_backward_chunks": float(outer_backward_chunk_count),
         }
+        loss_dict.update(self._video_ttt_gate_metrics())
         if self.loss_lambda_video_ttt != 0.0:
             loss_dict["loss_video_ttt_weighted"] = self.loss_lambda_video_ttt * loss_dict["loss_video_ttt"]
         if streaming_backward:
@@ -1286,6 +2272,12 @@ class FastWAM(torch.nn.Module):
         input_latents = inputs["input_latents"]
         context = inputs["context"]
         context_mask = inputs["context_mask"]
+        observation_context = inputs.get("observation_context")
+        observation_context_mask = inputs.get("observation_context_mask")
+        if observation_context is None:
+            observation_context = context
+        if observation_context_mask is None:
+            observation_context_mask = context_mask
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
@@ -1352,18 +2344,29 @@ class FastWAM(torch.nn.Module):
 
         for try_idx in range(num_tries):
             if try_idx > 0 and use_switch_chunks:
-                switch_tokens = build_observation_tokens(
-                    black_first_frame_latents,
-                    restart_context,
-                    restart_context_mask,
-                )
-                _, state, ttt_switch_loss = self._apply_video_ttt_observation(
-                    switch_tokens,
-                    state=state,
-                    persist_state=False,
-                    update=True,
-                    update_tokens=switch_tokens,
-                )
+                if self.video_ttt_uses_layer_hook:
+                    state, ttt_switch_loss = self._update_video_ttt_observation_inline(
+                        first_frame_latents=black_first_frame_latents,
+                        context=restart_context,
+                        context_mask=restart_context_mask,
+                        fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                        state=state,
+                        persist_state=False,
+                        update=True,
+                    )
+                else:
+                    switch_tokens = build_observation_tokens(
+                        black_first_frame_latents,
+                        restart_context,
+                        restart_context_mask,
+                    )
+                    _, state, ttt_switch_loss = self._apply_video_ttt_observation(
+                        switch_tokens,
+                        state=state,
+                        persist_state=False,
+                        update=True,
+                        update_tokens=switch_tokens,
+                    )
                 if ttt_switch_loss is not None:
                     ttt_switch_loss_total = ttt_switch_loss_total + ttt_switch_loss
                     ttt_loss_total = ttt_loss_total + ttt_switch_loss
@@ -1390,7 +2393,6 @@ class FastWAM(torch.nn.Module):
             noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
             target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
-            observation_tokens = build_observation_tokens(first_frame_latents, context, context_mask)
             video_pre = self.video_expert.pre_dit(
                 x=latents,
                 timestep=timestep_video,
@@ -1399,13 +2401,40 @@ class FastWAM(torch.nn.Module):
                 action=action,
                 fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
             )
-            video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
-                video_pre["tokens"],
-                state=state,
-                persist_state=False,
-                update=True,
-                update_tokens=observation_tokens,
-            )
+            video_ttt_hook = None
+            if self.video_ttt_uses_layer_hook:
+                state, ttt_loss = self._update_video_ttt_observation_inline(
+                    first_frame_latents=first_frame_latents,
+                    context=observation_context,
+                    context_mask=observation_context_mask,
+                    fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+                    state=state,
+                    persist_state=False,
+                    update=True,
+                    global_time=inputs.get("ttt_global_time", None),
+                )
+                video_ttt_positions = self._build_video_ttt_positions(
+                    meta=video_pre["meta"],
+                    batch_size=int(video_pre["tokens"].shape[0]),
+                    device=video_pre["tokens"].device,
+                    global_time=inputs.get("ttt_global_time", None),
+                    prefix_len=0,
+                )
+                video_tokens = video_pre["tokens"]
+                video_ttt_hook = self._build_video_ttt_layer_hook(state=state, positions=video_ttt_positions)
+            else:
+                observation_tokens = build_observation_tokens(
+                    first_frame_latents,
+                    observation_context,
+                    observation_context_mask,
+                )
+                video_tokens, state, ttt_loss = self._apply_video_ttt_observation(
+                    video_pre["tokens"],
+                    state=state,
+                    persist_state=False,
+                    update=True,
+                    update_tokens=observation_tokens,
+                )
             if ttt_loss is not None:
                 ttt_loss_total = ttt_loss_total + ttt_loss
                 ttt_loss_count += 1
@@ -1451,6 +2480,7 @@ class FastWAM(torch.nn.Module):
                     "video": video_pre["t_mod"],
                     "action": action_pre["t_mod"],
                 },
+                video_ttt_hook=video_ttt_hook,
             )
 
             pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -1562,6 +2592,33 @@ class FastWAM(torch.nn.Module):
             action=action,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
+        video_ttt_hook = None
+        if self.video_ttt_enabled and self.video_ttt_w0_training:
+            ttt_global_time = inputs.get("ttt_global_time", None)
+            video_ttt_positions = self._build_video_ttt_positions(
+                meta=video_pre["meta"],
+                batch_size=int(video_pre["tokens"].shape[0]),
+                device=video_pre["tokens"].device,
+                global_time=ttt_global_time,
+                prefix_len=0,
+            )
+            if self.video_ttt_uses_layer_hook:
+                video_ttt_hook = self._build_video_ttt_layer_hook(
+                    state=None,
+                    positions=video_ttt_positions,
+                )
+            else:
+                video_tokens, _, _ = self._apply_video_ttt_observation(
+                    video_pre["tokens"],
+                    state=None,
+                    persist_state=False,
+                    update=False,
+                    update_tokens=None,
+                    positions=video_ttt_positions,
+                    compute_loss=False,
+                )
+                video_pre = dict(video_pre)
+                video_pre["tokens"] = video_tokens
 
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
@@ -1603,6 +2660,7 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            video_ttt_hook=video_ttt_hook,
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -1643,6 +2701,9 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if self.video_ttt_enabled and self.video_ttt_w0_training:
+            loss_dict.update(self._video_ttt_gate_metrics())
+            loss_dict["video_ttt_w0_training"] = 1.0
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -1656,6 +2717,8 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
+        use_video_ttt: bool = True,
+        video_ttt_global_time: Optional[torch.Tensor | int | float] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -1679,9 +2742,32 @@ class FastWAM(torch.nn.Module):
             device=video_pre["tokens"].device,
         )
 
+        video_tokens = video_pre["tokens"]
+        video_ttt_hook = None
+        if use_video_ttt:
+            video_ttt_positions = self._build_video_ttt_positions(
+                meta=video_pre["meta"],
+                batch_size=int(video_pre["tokens"].shape[0]),
+                device=video_pre["tokens"].device,
+                global_time=video_ttt_global_time,
+                prefix_len=0,
+            )
+            if self.video_ttt_uses_layer_hook:
+                video_ttt_hook = self._build_video_ttt_layer_hook(positions=video_ttt_positions)
+            else:
+                video_tokens, _, _ = self._apply_video_ttt_observation(
+                    video_tokens,
+                    state=self._video_ttt_inference_state,
+                    persist_state=False,
+                    update=False,
+                    update_tokens=None,
+                    positions=video_ttt_positions,
+                    compute_loss=False,
+                )
+
         tokens_out = self.mot(
             embeds_all={
-                "video": video_pre["tokens"],
+                "video": video_tokens,
                 "action": action_pre["tokens"],
             },
             attention_mask=attention_mask,
@@ -1703,6 +2789,7 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            video_ttt_hook=video_ttt_hook,
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -1819,6 +2906,8 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
+        update_video_ttt: bool = True,
+        ttt_global_time: Optional[int | float | torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
         if test_action_with_infer_action:
@@ -1836,6 +2925,8 @@ class FastWAM(torch.nn.Module):
                 rand_device=rand_device,
                 tiled=tiled,
                 proprio=proprio.clone() if proprio is not None else None,
+                update_video_ttt=False,
+                ttt_global_time=ttt_global_time,
             )["action"]
         
         if input_image.ndim == 3:
@@ -1928,6 +3019,35 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 proprio=proprio,
             )
+        if self.video_ttt_enabled and update_video_ttt:
+            if self.video_ttt_uses_layer_hook:
+                _, _ = self._update_video_ttt_observation_inline(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    global_time=ttt_global_time,
+                    compute_loss=False,
+                )
+            else:
+                observation_tokens = self._build_video_ttt_observation_tokens(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    global_time=ttt_global_time,
+                )
+                _, _, _ = self._apply_video_ttt_observation(
+                    observation_tokens,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    update_tokens=observation_tokens,
+                    compute_loss=False,
+                )
 
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1959,6 +3079,8 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
                 gt_action=action,
+                use_video_ttt=True,
+                video_ttt_global_time=ttt_global_time,
             )
             pred_video = pred_video_posi
             pred_action = pred_action_posi
@@ -1996,6 +3118,8 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        update_video_ttt: bool = True,
+        ttt_global_time: Optional[int | float | torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -2081,15 +3205,35 @@ class FastWAM(torch.nn.Module):
             action=None,
             fuse_vae_embedding_in_latents=fuse_flag,
         )
-        video_tokens, _, _ = self._apply_video_ttt_observation(
-            video_pre["tokens"],
-            state=self._video_ttt_inference_state,
-            persist_state=True,
-            update=True,
-        )
-        if video_tokens is not video_pre["tokens"]:
-            video_pre = dict(video_pre)
-            video_pre["tokens"] = video_tokens
+        if self.video_ttt_enabled and update_video_ttt:
+            if self.video_ttt_uses_layer_hook:
+                _, _ = self._update_video_ttt_observation_inline(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    global_time=ttt_global_time,
+                    compute_loss=False,
+                )
+            else:
+                video_ttt_update_tokens = self._build_video_ttt_observation_tokens(
+                    first_frame_latents=first_frame_latents,
+                    context=context,
+                    context_mask=context_mask,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    global_time=ttt_global_time,
+                )
+                _, _, _ = self._apply_video_ttt_observation(
+                    video_ttt_update_tokens,
+                    state=self._video_ttt_inference_state,
+                    persist_state=True,
+                    update=True,
+                    update_tokens=video_ttt_update_tokens,
+                    compute_loss=False,
+                )
         video_seq_len = int(video_pre["tokens"].shape[1])
         attention_mask = self._build_mot_attention_mask(
             video_seq_len=video_seq_len,
@@ -2106,6 +3250,15 @@ class FastWAM(torch.nn.Module):
                 "mask": video_pre["context_mask"],
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            video_ttt_hook=self._build_video_ttt_layer_hook(
+                positions=self._build_video_ttt_positions(
+                    meta=video_pre["meta"],
+                    batch_size=int(video_pre["tokens"].shape[0]),
+                    device=video_pre["tokens"].device,
+                    global_time=ttt_global_time,
+                    prefix_len=0,
+                ),
+            ),
         )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
@@ -2153,6 +3306,8 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        update_video_ttt: bool = True,
+        ttt_global_time: Optional[int | float | torch.Tensor] = None,
     ):
         return self.infer_joint(
             prompt=prompt,
@@ -2170,6 +3325,8 @@ class FastWAM(torch.nn.Module):
             seed=seed,
             rand_device=rand_device,
             tiled=tiled,
+            update_video_ttt=update_video_ttt,
+            ttt_global_time=ttt_global_time,
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):

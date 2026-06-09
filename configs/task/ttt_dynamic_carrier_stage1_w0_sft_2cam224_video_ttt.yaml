@@ -1,13 +1,21 @@
 # @package _global_
 
 defaults:
-  - override /data: ttt_dynamic_carrier_observe20_2cam
+  - override /data: ttt_dynamic_carrier_slow100_observe10_2cam
   - override /model: fastwam
   - _self_
 
-batch_size: 4
-num_workers: 8
+batch_size: 16
+num_workers: 4
 gradient_accumulation_steps: 1
+
+data:
+  train:
+    # Stage1 samples only from the execution part of type2 demos.
+    # Future-video supervision stays at every 2 raw frames; action horizon remains 32.
+    action_video_freq_ratio: 2
+    stage1_execution_only: true
+    ttt_observation_instruction: null
 
 model:
   mot_checkpoint_mixed_attn: true
@@ -15,8 +23,9 @@ model:
   action_dit_pretrained_path: null
   video_ttt:
     enabled: true
-    observation_training: true
-    train_backbone: false
+    observation_training: false
+    w0_training: true
+    train_backbone: true
     train_residual_gate: true
     num_tries: 1
     switch_chunks: false
@@ -39,9 +48,9 @@ model:
     lambda_video_ttt: 0.0
 
 lr_scheduler_type: "cosine"
-learning_rate: 2.0e-4
+learning_rate: 2.0e-5
 num_epochs: 1
-max_steps: 30000
+max_steps: 10000
 log_every: 5
 save_every: 1000
 keep_last_checkpoints: 2
@@ -49,8 +58,8 @@ eval_every: 0
 eval_num_inference_steps: 10
 
 weight_decay: 1.0e-2
-resume: ./runs/ttt_dynamic_carrier_cream_2cam224_ft/20260531_0527_plain_gpu/checkpoints/weights/step_010000.pt
+resume: ./checkpoints/fastwam_release/libero_uncond_2cam224.pt
 
 wandb:
   enabled: false
-  name: ttt_dynamic_carrier_observe20_2cam224_video_ttt
+  name: ttt_dynamic_carrier_stage1_w0_sft_2cam224_video_ttt
