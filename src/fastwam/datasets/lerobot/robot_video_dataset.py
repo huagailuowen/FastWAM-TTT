@@ -462,6 +462,42 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
         relative_offsets = (offsets_tensor - int(origin_frame)).clamp(min=0)
         return torch.div(relative_offsets, int(self.ttt_time_stride), rounding_mode="floor")
 
+    def _execution_sample_offsets(self, start: int, max_start: int) -> list[int]:
+        offsets = list(range(int(start), int(max_start) + 1, int(self.chunk_interval)))
+        return [int(offset) for offset in offsets] or [int(start)]
+
+    def _prediction_phase_offsets(self, execution_start: int, max_start: int) -> list[int]:
+        phase_limit = min(
+            int(max_start),
+            int(execution_start) + int(self.execution_chunk_interval) - int(self.chunk_interval),
+        )
+        offsets = list(range(int(execution_start), int(phase_limit) + 1, int(self.chunk_interval)))
+        return [int(offset) for offset in offsets] or [int(execution_start)]
+
+    def _execution_prediction_offsets(self, first_prediction_offset: int, max_start: int) -> list[int]:
+        offsets = list(
+            range(int(first_prediction_offset), int(max_start) + 1, int(self.execution_chunk_interval))
+        )
+        return [int(offset) for offset in offsets] or [int(first_prediction_offset)]
+
+    def _policy_update_schedule(
+        self,
+        execution_start: int,
+        execution_offsets: list[int],
+    ) -> tuple[list[int], list[tuple[int, int]]]:
+        update_offsets: list[int] = []
+        update_ranges: list[tuple[int, int]] = []
+        next_update_offset = int(execution_start)
+        for prediction_offset in execution_offsets:
+            start_idx = len(update_offsets)
+            current = max(int(next_update_offset), int(execution_start))
+            while current <= int(prediction_offset):
+                update_offsets.append(int(current))
+                current += int(self.chunk_interval)
+            update_ranges.append((int(start_idx), int(len(update_offsets))))
+            next_update_offset = int(prediction_offset) + int(self.chunk_interval)
+        return update_offsets, update_ranges
+
     def _build_ttt_entries(self) -> list[dict]:
         groups = list(self.ttt_metadata.get("groups") or [])
         entries: list[dict] = []
@@ -523,6 +559,7 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                 )
                 start = min(max(action_start_frame, 0), max_start)
                 offsets = list(range(start, max_start + 1, self.execution_chunk_interval)) or [start]
+                execution_sample_offsets = self._execution_sample_offsets(start, max_start)
                 policy_update_offsets = []
                 if self.policy_update_during_execution:
                     policy_update_offsets = list(range(start, max_start + 1, self.chunk_interval)) or [start]
@@ -533,6 +570,7 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                         "episode_index": int(episode_index),
                         "offset": int(offsets[0]),
                         "execution_offsets": [int(offset) for offset in offsets],
+                        "execution_sample_offsets": [int(offset) for offset in execution_sample_offsets],
                         "policy_update_offsets": [int(offset) for offset in policy_update_offsets],
                         "action_start_frame": int(start),
                         "execution_start_frame": int(start),
@@ -736,7 +774,13 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
         try:
             entry = self.ttt_entries[int(idx)]
             if self.stage1_execution_only:
-                offsets = [int(offset) for offset in entry.get("execution_offsets", [entry["offset"]])]
+                offsets = [
+                    int(offset)
+                    for offset in entry.get(
+                        "execution_sample_offsets",
+                        entry.get("execution_offsets", [entry["offset"]]),
+                    )
+                ]
                 if len(offsets) <= 0:
                     raise ValueError("stage1 execution-only sample requires at least one execution offset.")
                 offset = int(random.choice(offsets))
@@ -801,9 +845,8 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                 ),
                 max_start,
             )
-            execution_offsets = list(
-                range(execution_start, max_start + 1, self.execution_chunk_interval)
-            ) or [execution_start]
+            first_prediction_offset = int(random.choice(self._prediction_phase_offsets(execution_start, max_start)))
+            execution_offsets = self._execution_prediction_offsets(first_prediction_offset, max_start)
             execution_samples = [
                 self._get(self._global_index(entry["episode_index"], offset))
                 for offset in execution_offsets
@@ -828,14 +871,19 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
             data["ttt_sequence_mode_id"] = torch.tensor(2, dtype=torch.long)
             data["ttt_group_id"] = torch.tensor(entry["group_id"], dtype=torch.long)
             data["ttt_chunk_offset"] = torch.tensor(execution_offsets[0], dtype=torch.long)
+            data["ttt_first_prediction_offset"] = torch.tensor(first_prediction_offset, dtype=torch.long)
             padded_offsets = list(execution_offsets)
             while len(padded_offsets) < self.max_execution_chunks:
                 padded_offsets.append(execution_offsets[-1])
             data["ttt_execution_offsets"] = torch.tensor(padded_offsets, dtype=torch.long)
             data["ttt_execution_times"] = self._offsets_to_ttt_times(padded_offsets, time_origin_frame)
             policy_update_offsets = []
+            policy_update_ranges: list[tuple[int, int]] = []
             if self.policy_update_during_execution:
-                policy_update_offsets = list(range(execution_start, max_start + 1, self.chunk_interval)) or [execution_start]
+                policy_update_offsets, policy_update_ranges = self._policy_update_schedule(
+                    execution_start,
+                    execution_offsets,
+                )
             if self.policy_update_during_execution:
                 (
                     policy_update_video,
@@ -851,6 +899,10 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                     policy_update_offsets_tensor,
                     time_origin_frame,
                 )
+                padded_ranges = list(policy_update_ranges)
+                while len(padded_ranges) < self.max_execution_chunks:
+                    padded_ranges.append((0, 0))
+                data["ttt_policy_update_ranges"] = torch.tensor(padded_ranges, dtype=torch.long)
                 data["ttt_policy_updates_per_execution_chunk"] = torch.tensor(
                     self.execution_chunk_interval // self.chunk_interval,
                     dtype=torch.long,

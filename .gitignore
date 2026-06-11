@@ -8,6 +8,9 @@ assets/
 runs
 runs/
 evaluate_results/
+logs/
+dataset_previews/
+core.*
 .deepspeed*
 .hf_cache/
 huggingface/

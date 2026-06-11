@@ -302,6 +302,21 @@ def _model_has_video_ttt_adapter(model: torch.nn.Module) -> bool:
     return bool(enabled)
 
 
+def _metadata_int(record: dict[str, Any], cfg: DictConfig, key: str, default: int = 0) -> int:
+    if key in record and record[key] is not None:
+        return int(record[key])
+    if key in cfg.EVALUATION and cfg.EVALUATION.get(key) is not None:
+        return int(cfg.EVALUATION.get(key))
+    if key in cfg.data.train and cfg.data.train.get(key) is not None:
+        return int(cfg.data.train.get(key))
+    return int(default)
+
+
+def _record_execution_start_frame(record: dict[str, Any], cfg: DictConfig) -> int:
+    fallback = _metadata_int(record, cfg, "action_start_frame", default=0)
+    return _metadata_int(record, cfg, "execution_start_frame", default=fallback)
+
+
 def _phase_shift_case(
     case: DynamicCarrierCase,
     *,
@@ -355,6 +370,21 @@ def _load_eval_cases(cfg: DictConfig) -> list[dict[str, Any]]:
                     "seed": int(try_seeds[0] if try_seeds else int(payload.get("seed", 0)) + fallback_idx),
                     "dataset_episode_index": int((group.get("episode_indices") or [start + fallback_idx])[0]),
                     "group_id": int(group.get("group_id", start + fallback_idx)),
+                    "observe_frames": int(group.get("observe_frames", payload.get("observe_frames", 0))),
+                    "action_start_frame": int(
+                        group.get(
+                            "action_start_frame",
+                            group.get("execution_start_frame", payload.get("action_start_frame", 0)),
+                        )
+                    ),
+                    "execution_start_frame": int(
+                        group.get(
+                            "execution_start_frame",
+                            group.get("action_start_frame", payload.get("execution_start_frame", 0)),
+                        )
+                    ),
+                    "observe_chunks": int(group.get("observe_chunks", payload.get("observe_chunks", 0))),
+                    "chunk_interval": int(group.get("chunk_interval", payload.get("chunk_interval", 0))),
                     "try_cases": try_cases,
                     "try_seeds": try_seeds,
                     "episode_indices": [int(x) for x in group.get("episode_indices", [])],
@@ -379,6 +409,21 @@ def _load_eval_cases(cfg: DictConfig) -> list[dict[str, Any]]:
                 "seed": int(item.get("seed", payload.get("seed", 0) + fallback_idx)),
                 "dataset_episode_index": int(item.get("episode_index", start + fallback_idx)),
                 "group_id": int(start + fallback_idx),
+                "observe_frames": int(item.get("observe_frames", payload.get("observe_frames", 0))),
+                "action_start_frame": int(
+                    item.get(
+                        "action_start_frame",
+                        item.get("execution_start_frame", payload.get("action_start_frame", 0)),
+                    )
+                ),
+                "execution_start_frame": int(
+                    item.get(
+                        "execution_start_frame",
+                        item.get("action_start_frame", payload.get("execution_start_frame", 0)),
+                    )
+                ),
+                "observe_chunks": int(payload.get("observe_chunks", 0)),
+                "chunk_interval": int(payload.get("chunk_interval", 0)),
                 "try_cases": [],
                 "try_seeds": [],
                 "episode_indices": [],
@@ -399,6 +444,19 @@ def _case_for_try(record: dict[str, Any], try_idx: int, tries_per_group: int) ->
         try_index=int(try_idx),
         tries_per_group=int(tries_per_group),
     )
+
+
+def _apply_case_eval_overrides(case: DynamicCarrierCase, cfg: DictConfig) -> DynamicCarrierCase:
+    updates: dict[str, Any] = {}
+    grasp_release_distance = cfg.EVALUATION.get("grasp_release_distance_override", None)
+    if grasp_release_distance is not None:
+        updates["grasp_release_distance"] = float(grasp_release_distance)
+    grasp_release_height = cfg.EVALUATION.get("grasp_release_height_override", None)
+    if grasp_release_height is not None:
+        updates["grasp_release_height"] = float(grasp_release_height)
+    if len(updates) == 0:
+        return case
+    return replace(case, **updates)
 
 
 def _seed_for_try(record: dict[str, Any], try_idx: int) -> int:
@@ -613,6 +671,22 @@ def _save_action_trace(trace_dir: Path, episode_result: dict[str, Any]) -> str:
     return str(path)
 
 
+def _fast_forward_with_dummy_action(
+    env: DynamicCarrierEnv,
+    obs: dict[str, Any],
+    steps: int,
+) -> tuple[dict[str, Any], bool, int]:
+    done = False
+    completed = 0
+    for _ in range(max(int(steps), 0)):
+        action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+        obs, _, done, _ = env.step(action)
+        completed += 1
+        if done:
+            break
+    return obs, done, completed
+
+
 def run_episode(
     *,
     case: DynamicCarrierCase,
@@ -627,6 +701,9 @@ def run_episode(
     input_h: int,
     model_device: str,
     reset_ttt_state: bool = True,
+    start_frame: int = 0,
+    ttt_time_origin_frame: Optional[int] = None,
+    implicit_observe_frames: Optional[int] = None,
 ) -> tuple[dict[str, Any], list[Any], list[dict[str, Any]], Optional[float]]:
     base_env, init_state, _ = create_libero_env_for_case(
         case,
@@ -640,6 +717,7 @@ def run_episode(
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 0))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    action_infer_updates_ttt = bool(cfg.EVALUATION.get("action_infer_updates_ttt", True))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
     if reset_ttt_state and hasattr(model, "reset_video_ttt_state"):
@@ -663,14 +741,43 @@ def run_episode(
         obs = env.reset(init_state=init_state)
         done = False
         success = False
-        pbar = tqdm(total=max_steps + num_steps_wait, desc=f"trial {trial_idx + 1}")
-        for t in range(max_steps + num_steps_wait):
+        elapsed_steps = 0
+        pre_rollout_steps = 0
+        if start_frame > 0:
+            obs, done, pre_rollout_steps = _fast_forward_with_dummy_action(
+                env,
+                obs,
+                int(start_frame),
+            )
+            elapsed_steps += int(pre_rollout_steps)
+
+        if ttt_time_origin_frame is None:
+            ttt_time_origin_frame = 0 if start_frame <= 0 else int(elapsed_steps)
+        ttt_time_stride = max(int(cfg.data.train.get("ttt_time_stride", 2)), 1)
+
+        def relative_ttt_time() -> int:
+            return max(int(elapsed_steps) - int(ttt_time_origin_frame), 0) // ttt_time_stride
+
+        wait_budget = 0 if done else max(num_steps_wait, 0)
+        if start_frame > 0:
+            policy_budget = max(int(max_steps) - int(elapsed_steps) - int(wait_budget), 0)
+        else:
+            policy_budget = max(int(max_steps), 0)
+        pbar = tqdm(total=wait_budget + policy_budget, desc=f"trial {trial_idx + 1}")
+
+        for _ in range(wait_budget):
+            if done:
+                break
+            action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+            obs, _, done, _ = env.step(action)
+            action_trace.append(action.tolist())
+            elapsed_steps += 1
             pbar.update(1)
-            if t < num_steps_wait:
-                action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
-                obs, _, done, _ = env.step(action)
-                action_trace.append(action.tolist())
-                continue
+
+        for _ in range(policy_budget):
+            pbar.update(1)
+            if done:
+                break
 
             if len(pending_actions) == 0:
                 action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
@@ -683,7 +790,8 @@ def run_episode(
                     input_w=input_w,
                     input_h=input_h,
                     model_device=model_device,
-                    ttt_global_time=len(action_trace) // 2,
+                    update_video_ttt=action_infer_updates_ttt,
+                    ttt_global_time=relative_ttt_time(),
                 )
                 replay_images.append(imgs.copy())
                 if predicted_future_frames is not None:
@@ -706,6 +814,7 @@ def run_episode(
             carrier_trace.append(env.carrier_position().astype(float).tolist())
             action_trace.append(action.astype(float).tolist())
             obs, _, done, _ = env.step(action)
+            elapsed_steps += 1
             if env.payload_attached_to_gripper and not pickup_success:
                 pickup_success = True
                 first_pickup_step = len(action_trace)
@@ -745,6 +854,13 @@ def run_episode(
             "pickup_success": bool(pickup_success),
             "first_pickup_step": int(first_pickup_step) if first_pickup_step is not None else None,
             "steps": int(len(action_trace)),
+            "pre_rollout_steps": int(pre_rollout_steps),
+            "execution_start_frame": int(start_frame),
+            "ttt_time_origin_frame": int(ttt_time_origin_frame),
+            "implicit_observe_frames": (
+                int(implicit_observe_frames) if implicit_observe_frames is not None else None
+            ),
+            "action_infer_updates_ttt": bool(action_infer_updates_ttt),
             "actions": action_trace,
             "eef_xyz": eef_trace,
             "payload_xyz": payload_trace,
@@ -770,6 +886,7 @@ def run_observe_then_act_episode(
     input_h: int,
     model_device: str,
     reset_ttt_state: bool = True,
+    execution_start_frame: int = 0,
 ) -> tuple[dict[str, Any], list[Any], list[dict[str, Any]], Optional[float]]:
     base_env, init_state, _ = create_libero_env_for_case(
         case,
@@ -843,11 +960,6 @@ def run_observe_then_act_episode(
     pickup_success = False
     first_pickup_step: Optional[int] = None
 
-    total_budget = (
-        max_steps
-        if count_observe_steps
-        else num_steps_wait + observe_frames + max_steps
-    )
     pbar = None
     try:
         obs = env.reset(init_state=init_state)
@@ -862,11 +974,26 @@ def run_observe_then_act_episode(
         done = False
         success = False
         elapsed_steps = 0
+        observe_start_frame = max(int(execution_start_frame) - int(observe_frames), 0)
+        pre_observe_steps = 0
+        if observe_start_frame > 0:
+            obs, done, pre_observe_steps = _fast_forward_with_dummy_action(
+                env,
+                obs,
+                observe_start_frame,
+            )
+            elapsed_steps += int(pre_observe_steps)
+
         observe_steps_done = 0
         observe_ttt_updates = 0
         policy_ttt_updates = 0
         ttt_update_seconds: list[float] = []
         action_infer_seconds: list[float] = []
+        total_budget = (
+            max(int(max_steps) - int(elapsed_steps), 0)
+            if count_observe_steps
+            else num_steps_wait + observe_frames + max_steps
+        )
         pbar = tqdm(total=total_budget, desc=f"trial {trial_idx + 1} observe_then_act")
 
         for _ in range(num_steps_wait):
@@ -1047,6 +1174,10 @@ def run_observe_then_act_episode(
             "observe_then_act_mean_action_infer_s": (
                 float(np.mean(action_infer_seconds)) if len(action_infer_seconds) > 0 else None
             ),
+            "pre_observe_steps": int(pre_observe_steps),
+            "observe_start_frame": int(observe_start_frame),
+            "execution_start_frame": int(execution_start_frame),
+            "ttt_time_origin_frame": int(ttt_time_origin_step),
             "observe_steps": int(observe_steps_done),
             "policy_steps": int(policy_steps),
             "actions": action_trace,
@@ -1202,6 +1333,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         cfg.EVALUATION.get("warmup_update_interval", cfg.EVALUATION.get("replan_steps", 10))
     )
     observe_then_act_chunks = int(cfg.EVALUATION.get("observe_then_act_chunks", 0))
+    in_domain_execution_start = bool(cfg.EVALUATION.get("in_domain_execution_start", False))
     if warmup_passes < 0:
         raise ValueError(f"EVALUATION.warmup_passes must be non-negative, got {warmup_passes}.")
     if warmup_passes > 0 and warmup_policy != "scripted":
@@ -1238,6 +1370,17 @@ def main(cfg: DictConfig) -> dict[str, Any]:
         "observe_then_act_update_interval": (
             int(_get_observe_then_act_update_interval(cfg)) if observe_then_act_chunks > 0 else None
         ),
+        "in_domain_execution_start": bool(in_domain_execution_start),
+        "grasp_release_distance_override": (
+            float(cfg.EVALUATION.get("grasp_release_distance_override"))
+            if cfg.EVALUATION.get("grasp_release_distance_override", None) is not None
+            else None
+        ),
+        "grasp_release_height_override": (
+            float(cfg.EVALUATION.get("grasp_release_height_override"))
+            if cfg.EVALUATION.get("grasp_release_height_override", None) is not None
+            else None
+        ),
     }
     psnr_values: list[float] = []
     tries_per_group = int(
@@ -1249,12 +1392,31 @@ def main(cfg: DictConfig) -> dict[str, Any]:
 
     for trial_idx, record in enumerate(cases):
         base_case: DynamicCarrierCase = record["case"]
-        case = base_case
+        case = _apply_case_eval_overrides(base_case, cfg)
         seed = int(record["seed"])
         dataset_episode_index = int(record["dataset_episode_index"])
         warmup_summaries: list[dict[str, Any]] = []
         restart_marker_losses: list[Optional[float]] = []
         reset_ttt_state = True
+        execution_start_frame = (
+            _record_execution_start_frame(record, cfg) if in_domain_execution_start else 0
+        )
+        implicit_observe_frames: Optional[int] = None
+        implicit_time_origin_frame: Optional[int] = None
+        if (
+            in_domain_execution_start
+            and observe_then_act_chunks <= 0
+            and _model_has_video_ttt_adapter(model)
+        ):
+            implicit_observe_frames = _select_observe_then_act_frames(
+                cfg,
+                update_interval=_get_observe_then_act_update_interval(cfg),
+                max_chunks=int(cfg.data.train.get("observe_chunks", 1)),
+            )
+            implicit_time_origin_frame = max(
+                int(execution_start_frame) - int(implicit_observe_frames),
+                0,
+            )
         if observe_then_act_chunks > 0:
             episode, replay_images, future_clips, episode_psnr = run_observe_then_act_episode(
                 case=case,
@@ -1269,6 +1431,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 input_h=input_h,
                 model_device=device,
                 reset_ttt_state=True,
+                execution_start_frame=execution_start_frame,
             )
         elif warmup_passes > 0:
             if hasattr(model, "reset_video_ttt_state"):
@@ -1284,7 +1447,10 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                             model_device=device,
                         )
                     )
-                warmup_case = _case_for_try(record, pass_idx, tries_per_group=tries_per_group)
+                warmup_case = _apply_case_eval_overrides(
+                    _case_for_try(record, pass_idx, tries_per_group=tries_per_group),
+                    cfg,
+                )
                 warmup_summaries.append(
                     run_scripted_ttt_warmup_pass(
                         case=warmup_case,
@@ -1309,7 +1475,10 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                     model_device=device,
                 )
             )
-            case = _case_for_try(record, warmup_passes, tries_per_group=tries_per_group)
+            case = _apply_case_eval_overrides(
+                _case_for_try(record, warmup_passes, tries_per_group=tries_per_group),
+                cfg,
+            )
             seed = _seed_for_try(record, warmup_passes)
             dataset_episode_index = _episode_index_for_try(record, warmup_passes)
             reset_ttt_state = False
@@ -1327,6 +1496,9 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 input_h=input_h,
                 model_device=device,
                 reset_ttt_state=reset_ttt_state,
+                start_frame=execution_start_frame,
+                ttt_time_origin_frame=implicit_time_origin_frame,
+                implicit_observe_frames=implicit_observe_frames,
             )
         else:
             episode, replay_images, future_clips, episode_psnr = run_episode(
@@ -1342,6 +1514,9 @@ def main(cfg: DictConfig) -> dict[str, Any]:
                 input_h=input_h,
                 model_device=device,
                 reset_ttt_state=reset_ttt_state,
+                start_frame=execution_start_frame,
+                ttt_time_origin_frame=implicit_time_origin_frame,
+                implicit_observe_frames=implicit_observe_frames,
             )
         if warmup_passes > 0:
             episode["warmup_passes"] = int(warmup_passes)

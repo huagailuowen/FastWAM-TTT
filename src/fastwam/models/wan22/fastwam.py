@@ -2020,6 +2020,7 @@ class FastWAM(torch.nn.Module):
             policy_update_proprio = sample.get("ttt_policy_update_proprio")
             policy_update_mask = sample.get("ttt_policy_update_mask")
             policy_update_times = sample.get("ttt_policy_update_times")
+            policy_update_ranges = sample.get("ttt_policy_update_ranges")
             if policy_update_times is None and isinstance(sample.get("ttt_policy_update_offsets"), torch.Tensor):
                 policy_update_times = self._offsets_to_video_ttt_global_time(sample["ttt_policy_update_offsets"])
             updates_per_execution_chunk = 0
@@ -2042,6 +2043,18 @@ class FastWAM(torch.nn.Module):
                 policy_update_mask = policy_update_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
             if isinstance(policy_update_times, torch.Tensor):
                 policy_update_times = policy_update_times.to(device=self.device, dtype=torch.long, non_blocking=True)
+            if isinstance(policy_update_ranges, torch.Tensor):
+                policy_update_ranges = policy_update_ranges.to(device=self.device, dtype=torch.long, non_blocking=True)
+                if policy_update_ranges.ndim != 3 or policy_update_ranges.shape[2] != 2:
+                    raise ValueError(
+                        "`ttt_policy_update_ranges` must be [B,N,2], "
+                        f"got {tuple(policy_update_ranges.shape)}."
+                    )
+                if policy_update_ranges.shape[0] != execution_mask.shape[0]:
+                    raise ValueError(
+                        "`ttt_policy_update_ranges` batch dimension must match execution mask, "
+                        f"got {policy_update_ranges.shape[0]} and {execution_mask.shape[0]}."
+                    )
             valid_count_total_expected = int(execution_mask.sum().item())
             if valid_count_total_expected <= 0:
                 raise ValueError("Sequential observe-then-act TTT found no valid execution chunks.")
@@ -2063,89 +2076,147 @@ class FastWAM(torch.nn.Module):
                 pending_outer_backward_loss = None
                 pending_outer_backward_chunks = 0
 
+            def apply_policy_updates_for_span(
+                update_start: int,
+                update_end: int,
+                update_mask_slice: torch.Tensor,
+            ) -> None:
+                nonlocal state
+                nonlocal ttt_loss_total
+                nonlocal ttt_loss_count
+                if (
+                    update_end <= update_start
+                    or not isinstance(policy_update_video, torch.Tensor)
+                    or not isinstance(policy_update_proprio, torch.Tensor)
+                    or not isinstance(update_mask_slice, torch.Tensor)
+                    or update_mask_slice.numel() == 0
+                    or not bool(update_mask_slice.any().item())
+                ):
+                    return
+                update_start = int(update_start)
+                update_end = int(update_end)
+                if use_grouped_observe_prefill:
+                    group_start = update_start
+                    while group_start < update_end:
+                        group_end = min(group_start + observe_prefill_group_size, update_end)
+                        local_start = group_start - update_start
+                        local_end = group_end - update_start
+                        state, ttt_loss_sum, group_ttt_count = self._training_loss_video_ttt_switch_chunk_group(
+                            state=state,
+                            frames=policy_update_video[:, group_start:group_end],
+                            proprios=policy_update_proprio[:, group_start:group_end],
+                            mask=update_mask_slice[:, local_start:local_end],
+                            context=context,
+                            context_mask=context_mask,
+                            fuse_vae_embedding_in_latents=fuse_flag,
+                            tiled=tiled,
+                            global_times=(
+                                policy_update_times[:, group_start:group_end]
+                                if isinstance(policy_update_times, torch.Tensor)
+                                else None
+                            ),
+                        )
+                        if group_ttt_count > 0:
+                            if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                                backward_fn(
+                                    self.loss_lambda_video_ttt * ttt_loss_sum / float(ttt_loss_count_expected),
+                                    retain_graph=True,
+                                )
+                            ttt_loss_for_total = ttt_loss_sum.detach() if streaming_backward else ttt_loss_sum
+                            ttt_loss_total = ttt_loss_total + ttt_loss_for_total
+                            ttt_loss_count += int(group_ttt_count)
+                        group_start = group_end
+                    return
+
+                for update_idx in range(update_start, update_end):
+                    local_idx = int(update_idx - update_start)
+                    update_indices = torch.nonzero(
+                        update_mask_slice[:, local_idx],
+                        as_tuple=False,
+                    ).flatten()
+                    if update_indices.numel() == 0:
+                        continue
+                    update_indices_device = update_indices.to(device=self.device)
+                    frame = policy_update_video.index_select(0, update_indices_device)[:, update_idx].unsqueeze(2)
+                    first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
+                    obs_context = context.index_select(0, update_indices_device)
+                    obs_context_mask = context_mask.index_select(0, update_indices_device)
+                    if self.proprio_encoder is not None:
+                        obs_context, obs_context_mask = self._append_proprio_to_context(
+                            context=obs_context,
+                            context_mask=obs_context_mask,
+                            proprio=policy_update_proprio.index_select(0, update_indices_device)[:, update_idx],
+                        )
+                    sub_state = self._select_video_ttt_state(state, update_indices_device)
+                    global_time = None
+                    if isinstance(policy_update_times, torch.Tensor):
+                        global_time = policy_update_times.index_select(0, update_indices_device)[:, update_idx]
+                    sub_state, ttt_update_loss = self._training_loss_video_ttt_switch_chunk(
+                        state=sub_state,
+                        first_frame_latents=first_frame_latents,
+                        context=obs_context,
+                        context_mask=obs_context_mask,
+                        fuse_vae_embedding_in_latents=fuse_flag,
+                        global_time=global_time,
+                    )
+                    valid_update_count = int(update_indices.numel())
+                    if ttt_update_loss is not None:
+                        if streaming_backward and self.loss_lambda_video_ttt != 0.0:
+                            backward_fn(
+                                self.loss_lambda_video_ttt
+                                * ttt_update_loss
+                                * (float(valid_update_count) / float(ttt_loss_count_expected)),
+                                retain_graph=True,
+                            )
+                        ttt_loss_for_total = ttt_update_loss.detach() if streaming_backward else ttt_update_loss
+                        ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_update_count)
+                        ttt_loss_count += valid_update_count
+                    state = self._scatter_video_ttt_state(state, sub_state, update_indices_device)
+
             for chunk_idx in range(int(execution_video.shape[1])):
                 if (
-                    chunk_idx > 0
-                    and updates_per_execution_chunk > 0
-                    and isinstance(policy_update_video, torch.Tensor)
+                    isinstance(policy_update_video, torch.Tensor)
                     and isinstance(policy_update_proprio, torch.Tensor)
                     and isinstance(policy_update_mask, torch.Tensor)
                 ):
-                    update_start = int((chunk_idx - 1) * updates_per_execution_chunk)
-                    update_end = min(update_start + int(updates_per_execution_chunk), int(policy_update_video.shape[1]))
-                    if use_grouped_observe_prefill:
-                        group_start = update_start
-                        while group_start < update_end:
-                            group_end = min(group_start + observe_prefill_group_size, update_end)
-                            state, ttt_loss_sum, group_ttt_count = self._training_loss_video_ttt_switch_chunk_group(
-                                state=state,
-                                frames=policy_update_video[:, group_start:group_end],
-                                proprios=policy_update_proprio[:, group_start:group_end],
-                                mask=policy_update_mask[:, group_start:group_end],
-                                context=observation_context,
-                                context_mask=observation_context_mask,
-                                fuse_vae_embedding_in_latents=fuse_flag,
-                                tiled=tiled,
-                                global_times=(
-                                    policy_update_times[:, group_start:group_end]
-                                    if isinstance(policy_update_times, torch.Tensor)
-                                    else None
-                                ),
+                    if isinstance(policy_update_ranges, torch.Tensor):
+                        if chunk_idx < int(policy_update_ranges.shape[1]):
+                            ranges_for_chunk = policy_update_ranges[:, chunk_idx]
+                            update_positions = torch.arange(
+                                int(policy_update_video.shape[1]),
+                                device=self.device,
+                                dtype=torch.long,
+                            ).view(1, -1)
+                            starts = ranges_for_chunk[:, 0].view(-1, 1)
+                            ends = ranges_for_chunk[:, 1].view(-1, 1)
+                            chunk_update_mask = (
+                                (update_positions >= starts)
+                                & (update_positions < ends)
+                                & policy_update_mask
                             )
-                            if group_ttt_count > 0:
-                                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
-                                    backward_fn(
-                                        self.loss_lambda_video_ttt * ttt_loss_sum / float(ttt_loss_count_expected),
-                                        retain_graph=True,
-                                    )
-                                ttt_loss_for_total = ttt_loss_sum.detach() if streaming_backward else ttt_loss_sum
-                                ttt_loss_total = ttt_loss_total + ttt_loss_for_total
-                                ttt_loss_count += int(group_ttt_count)
-                            group_start = group_end
-                    else:
-                        for update_idx in range(update_start, update_end):
-                            update_indices = torch.nonzero(
-                                policy_update_mask[:, update_idx],
+                            active_update_positions = torch.nonzero(
+                                chunk_update_mask.any(dim=0),
                                 as_tuple=False,
                             ).flatten()
-                            if update_indices.numel() == 0:
-                                continue
-                            update_indices_device = update_indices.to(device=self.device)
-                            frame = policy_update_video.index_select(0, update_indices_device)[:, update_idx].unsqueeze(2)
-                            first_frame_latents = self._encode_video_latents(frame, tiled=tiled)
-                            obs_context = observation_context.index_select(0, update_indices_device)
-                            obs_context_mask = observation_context_mask.index_select(0, update_indices_device)
-                            if self.proprio_encoder is not None:
-                                obs_context, obs_context_mask = self._append_proprio_to_context(
-                                    context=obs_context,
-                                    context_mask=obs_context_mask,
-                                    proprio=policy_update_proprio.index_select(0, update_indices_device)[:, update_idx],
+                            if active_update_positions.numel() > 0:
+                                update_start = int(active_update_positions[0].item())
+                                update_end = int(active_update_positions[-1].item()) + 1
+                                apply_policy_updates_for_span(
+                                    update_start,
+                                    update_end,
+                                    chunk_update_mask[:, update_start:update_end],
                                 )
-                            sub_state = self._select_video_ttt_state(state, update_indices_device)
-                            global_time = None
-                            if isinstance(policy_update_times, torch.Tensor):
-                                global_time = policy_update_times.index_select(0, update_indices_device)[:, update_idx]
-                            sub_state, ttt_update_loss = self._training_loss_video_ttt_switch_chunk(
-                                state=sub_state,
-                                first_frame_latents=first_frame_latents,
-                                context=obs_context,
-                                context_mask=obs_context_mask,
-                                fuse_vae_embedding_in_latents=fuse_flag,
-                                global_time=global_time,
-                            )
-                            valid_update_count = int(update_indices.numel())
-                            if ttt_update_loss is not None:
-                                if streaming_backward and self.loss_lambda_video_ttt != 0.0:
-                                    backward_fn(
-                                        self.loss_lambda_video_ttt
-                                        * ttt_update_loss
-                                        * (float(valid_update_count) / float(ttt_loss_count_expected)),
-                                        retain_graph=True,
-                                    )
-                                ttt_loss_for_total = ttt_update_loss.detach() if streaming_backward else ttt_update_loss
-                                ttt_loss_total = ttt_loss_total + ttt_loss_for_total * float(valid_update_count)
-                                ttt_loss_count += valid_update_count
-                            state = self._scatter_video_ttt_state(state, sub_state, update_indices_device)
+                    elif chunk_idx > 0 and updates_per_execution_chunk > 0:
+                        update_start = int((chunk_idx - 1) * updates_per_execution_chunk)
+                        update_end = min(
+                            update_start + int(updates_per_execution_chunk),
+                            int(policy_update_video.shape[1]),
+                        )
+                        apply_policy_updates_for_span(
+                            update_start,
+                            update_end,
+                            policy_update_mask[:, update_start:update_end],
+                        )
 
                 valid_indices = torch.nonzero(execution_mask[:, chunk_idx], as_tuple=False).flatten()
                 if valid_indices.numel() == 0:
