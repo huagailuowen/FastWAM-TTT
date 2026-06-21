@@ -44,7 +44,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         val_set_proportion=0.05,
         is_training_set=False,
         global_sample_stride=1,
-        action_video_freq_ratio: int = 1,
+        action_video_freq_ratio: int = 4,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
@@ -314,6 +314,111 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         return data
 
 
+class RobotVideoExecutionStartDataset(RobotVideoDataset):
+    """Plain RobotVideoDataset view that skips each episode's observation prefix.
+
+    This keeps the normal FastWAM sampling path intact while restricting start
+    indices to frames at or after the recorded execution/action start.
+    """
+
+    def __init__(
+        self,
+        *args,
+        metadata_filename: str = "dynamic_carrier_generation_metadata.json",
+        execution_start_key: str = "execution_start_frame",
+        fallback_start_key: str = "action_start_frame",
+        execution_start_frame: Optional[int] = None,
+        max_episodes: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.execution_start_frame = execution_start_frame
+        self.execution_start_key = execution_start_key
+        self.fallback_start_key = fallback_start_key
+        self.max_episodes = max_episodes
+        self._index_map = self._build_execution_index_map(metadata_filename)
+        if len(self._index_map) <= 0:
+            raise ValueError("RobotVideoExecutionStartDataset produced an empty execution index map.")
+
+    def _metadata_start_by_episode(self, dataset_dir: str, metadata_filename: str) -> dict[int, int]:
+        if self.execution_start_frame is not None:
+            return {}
+        metadata_path = Path(dataset_dir) / metadata_filename
+        if not metadata_path.exists():
+            logger.warning(
+                "Execution metadata %s does not exist; falling back to start frame 0.",
+                metadata_path,
+            )
+            return {}
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        default_start = int(
+            payload.get(
+                self.execution_start_key,
+                payload.get(self.fallback_start_key, payload.get("observe_frames", 0)),
+            )
+            or 0
+        )
+        episode_entries = (
+            payload.get("successful_episodes")
+            or payload.get("successes")
+            or payload.get("episodes")
+            or []
+        )
+        starts: dict[int, int] = {}
+        if isinstance(episode_entries, list):
+            for item in episode_entries:
+                if not isinstance(item, dict) or "episode_index" not in item:
+                    continue
+                starts[int(item["episode_index"])] = int(
+                    item.get(
+                        self.execution_start_key,
+                        item.get(self.fallback_start_key, default_start),
+                    )
+                    or 0
+                )
+        return starts
+
+    def _build_execution_index_map(self, metadata_filename: str) -> list[int]:
+        index_map: list[int] = []
+        global_frame_offset = 0
+        global_episode_count = 0
+        for dataset_dir, dataset in zip(
+            self.lerobot_dataset.dataset_dirs,
+            self.lerobot_dataset.multi_dataset._datasets,
+        ):
+            starts = self._metadata_start_by_episode(dataset_dir, metadata_filename)
+            for local_episode_idx in range(dataset.num_episodes):
+                if self.max_episodes is not None and global_episode_count >= int(self.max_episodes):
+                    return index_map
+                ep_start = int(dataset.episode_data_index["from"][local_episode_idx].item())
+                ep_end = int(dataset.episode_data_index["to"][local_episode_idx].item())
+                execution_start = (
+                    int(self.execution_start_frame)
+                    if self.execution_start_frame is not None
+                    else int(starts.get(local_episode_idx, 0))
+                )
+                mapped_start = min(max(ep_start + max(execution_start, 0), ep_start), ep_end)
+                index_map.extend(range(global_frame_offset + mapped_start, global_frame_offset + ep_end))
+                global_episode_count += 1
+            global_frame_offset += int(dataset.num_frames)
+        return index_map
+
+    def __len__(self):
+        return len(self._index_map)
+
+    def __getitem__(self, idx):
+        mapped_idx = self._index_map[int(idx)]
+        try:
+            data = self._get(mapped_idx)
+        except Exception as e:
+            print(f"Error processing mapped sample idx {mapped_idx}: {e}. Returning a random sample instead.")
+            print(traceback.format_exc())
+            random_idx = np.random.randint(len(self._index_map))
+            data = self._get(self._index_map[random_idx])
+        return data
+
+
 class RobotVideoTTTGroupedDataset(RobotVideoDataset):
     """LeRobot dynamic-carrier dataset with explicit TTT episode structure.
 
@@ -347,25 +452,58 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
         entry_repeat: int = 1,
         **kwargs,
     ):
+        dataset_dirs = kwargs.get("dataset_dirs")
+        if dataset_dirs is None and len(args) >= 1:
+            dataset_dirs = args[0]
+        if isinstance(dataset_dirs, (str, os.PathLike)):
+            dataset_dirs_list = [str(dataset_dirs)]
+        else:
+            dataset_dirs_list = [str(path) for path in (dataset_dirs or [])]
+
         if ttt_observation_instruction is None and not bool(stage1_execution_only):
             ttt_observation_instruction = DEFAULT_TTT_OBSERVATION_INSTRUCTION
         if ttt_observation_instruction is not None:
             kwargs.setdefault("observation_instruction", str(ttt_observation_instruction))
         super().__init__(*args, **kwargs)
+
+        if ttt_metadata_path is None and not dataset_dirs_list:
+            raise ValueError("`ttt_metadata_path` is required when dataset_dirs is empty.")
         if ttt_metadata_path is None:
-            dataset_dirs = kwargs.get("dataset_dirs")
-            if dataset_dirs is None and len(args) >= 1:
-                dataset_dirs = args[0]
-            if not dataset_dirs:
-                raise ValueError("`ttt_metadata_path` is required when dataset_dirs is empty.")
-            ttt_metadata_path = str(Path(str(dataset_dirs[0])) / "dynamic_carrier_generation_metadata.json")
-        self.ttt_metadata_path = Path(ttt_metadata_path)
-        self.ttt_metadata = json.loads(self.ttt_metadata_path.read_text(encoding="utf-8"))
+            metadata_paths = [
+                Path(dataset_dir) / "dynamic_carrier_generation_metadata.json"
+                for dataset_dir in dataset_dirs_list
+            ]
+            underlying_datasets = list(getattr(self.lerobot_dataset.multi_dataset, "_datasets", []))
+            episode_offset = 0
+            metadata_sources = []
+            for source_idx, metadata_path in enumerate(metadata_paths):
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata_sources.append((payload, int(episode_offset), metadata_path))
+                if source_idx < len(underlying_datasets):
+                    episode_offset += int(underlying_datasets[source_idx].num_episodes)
+                else:
+                    episode_offset += int(payload.get("episodes_collected", 0) or 0)
+        else:
+            metadata_path = Path(ttt_metadata_path)
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata_sources = [(payload, 0, metadata_path)]
+
+        self.ttt_metadata_sources = metadata_sources
+        self.ttt_metadata_paths = [source[2] for source in metadata_sources]
+        self.ttt_metadata_path = self.ttt_metadata_paths[0]
+        self.ttt_metadata = metadata_sources[0][0]
         self.ttt_mode = str(ttt_mode or self.ttt_metadata.get("ttt_mode", "")).strip()
         if self.ttt_mode not in {"repeat_attempt", "observe_then_act"}:
             raise ValueError(
                 f"`ttt_mode` must be repeat_attempt or observe_then_act, got {self.ttt_mode!r}."
             )
+        for payload, _, metadata_path in self.ttt_metadata_sources:
+            payload_mode = str(payload.get("ttt_mode", self.ttt_mode)).strip()
+            if payload_mode != self.ttt_mode:
+                raise ValueError(
+                    f"All TTT metadata files must use mode {self.ttt_mode!r}; "
+                    f"{metadata_path} has {payload_mode!r}."
+                )
         self.tries_per_group = int(tries_per_group)
         self.observe_chunks = int(observe_chunks)
         self.chunk_interval = int(chunk_interval)
@@ -428,13 +566,14 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
         return int(starts[episode_index].item()), int(ends[episode_index].item())
 
     def _max_valid_start(self, episode_indices: list[int]) -> int:
-        stride = int(self.lerobot_dataset.global_sample_stride)
-        required_tail = (int(self.num_frames) - 1) * stride
         lengths = []
         for episode_index in episode_indices:
             start, end = self._episode_bounds(int(episode_index))
             lengths.append(max(int(end - start), 1))
-        return max(min(lengths) - 1 - required_tail, 0)
+        # Match RobotVideoDataset/LeRobot semantics: a start index may point to
+        # the final real frame, and the missing future horizon is represented by
+        # image/action/proprio pad masks.
+        return max(min(lengths) - 1, 0)
 
     def _global_index(self, episode_index: int, offset: int) -> int:
         start, _ = self._episode_bounds(int(episode_index))
@@ -499,25 +638,31 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
         return update_offsets, update_ranges
 
     def _build_ttt_entries(self) -> list[dict]:
-        groups = list(self.ttt_metadata.get("groups") or [])
         entries: list[dict] = []
-        if self.ttt_mode == "repeat_attempt":
-            for group in groups:
-                episode_indices = [int(x) for x in group.get("episode_indices", [])[: self.tries_per_group]]
-                if len(episode_indices) < self.tries_per_group:
-                    continue
-                max_start = self._max_valid_start(episode_indices)
-                offsets = list(range(0, max_start + 1, self.execution_chunk_interval)) or [0]
-                entries.append(
-                    {
-                        "mode": "repeat_attempt",
-                        "group_id": int(group.get("group_id", len(entries))),
-                        "episode_indices": episode_indices,
-                        "offset": int(offsets[0]),
-                        "execution_offsets": [int(offset) for offset in offsets],
-                    }
-                )
-        else:
+        for payload, episode_offset, metadata_path in self.ttt_metadata_sources:
+            groups = list(payload.get("groups") or [])
+            if self.ttt_mode == "repeat_attempt":
+                for group in groups:
+                    episode_indices = [
+                        int(x) + int(episode_offset)
+                        for x in group.get("episode_indices", [])[: self.tries_per_group]
+                    ]
+                    if len(episode_indices) < self.tries_per_group:
+                        continue
+                    max_start = self._max_valid_start(episode_indices)
+                    offsets = list(range(0, max_start + 1, self.execution_chunk_interval)) or [0]
+                    entries.append(
+                        {
+                            "mode": "repeat_attempt",
+                            "group_id": len(entries),
+                            "episode_indices": episode_indices,
+                            "offset": int(offsets[0]),
+                            "execution_offsets": [int(offset) for offset in offsets],
+                            "ttt_metadata_path": str(metadata_path),
+                        }
+                    )
+                continue
+
             if not groups:
                 groups = [
                     {
@@ -531,12 +676,15 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                             )
                         ),
                     }
-                    for idx, item in enumerate(self.ttt_metadata.get("successes", []))
+                    for idx, item in enumerate(payload.get("successes", []))
                     if item.get("episode_index") is not None
                 ]
             default_observe_frames = int(self.observe_chunks * self.chunk_interval)
             for group in groups:
-                episode_indices = [int(x) for x in group.get("episode_indices", [])]
+                episode_indices = [
+                    int(x) + int(episode_offset)
+                    for x in group.get("episode_indices", [])
+                ]
                 if not episode_indices:
                     continue
                 episode_index = episode_indices[0]
@@ -566,7 +714,7 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                 entries.append(
                     {
                         "mode": "observe_then_act",
-                        "group_id": int(group.get("group_id", len(entries))),
+                        "group_id": len(entries),
                         "episode_index": int(episode_index),
                         "offset": int(offsets[0]),
                         "execution_offsets": [int(offset) for offset in offsets],
@@ -577,10 +725,11 @@ class RobotVideoTTTGroupedDataset(RobotVideoDataset):
                         "observe_frames": int(observe_frames_max),
                         "observe_frames_min": int(observe_frames_min),
                         "observe_frames_max": int(observe_frames_max),
+                        "ttt_metadata_path": str(metadata_path),
                     }
                 )
         if not entries:
-            raise ValueError(f"No TTT entries could be built from {self.ttt_metadata_path}.")
+            raise ValueError(f"No TTT entries could be built from {self.ttt_metadata_paths}.")
         return entries
 
     def __len__(self):

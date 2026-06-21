@@ -1,7 +1,7 @@
 train:
-  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoTTTGroupedDataset
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - ./data/ttt_dynamic_carrier_observe20_200_lerobot
+    - /inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/tool_adaptation_Project/TTTdynamics/repos/FastWAM/data/ttt_dynamic_carrier_slow100_exec_from100_lerobot
   shape_meta:
     images:
       - key: image
@@ -27,20 +27,6 @@ train:
   is_training_set: true
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
-  restart_instruction: null
-  ttt_mode: observe_then_act
-  tries_per_group: 1
-  observe_chunks: 30
-  chunk_interval: 2
-  execution_chunk_interval: 10
-  observe_frames: null
-  observe_frames_min: 40
-  observe_frames_max: 60
-  random_observe_frames: true
-  policy_update_during_execution: true
-  ttt_time_stride: 2
-  ttt_observation_instruction: "observe the motion trajectory of the object that needs to be grasped; do not take any action"
-  entry_repeat: 8
   pretrained_norm_stats: null
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
@@ -65,5 +51,5 @@ train:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/ttt_dynamic_carrier_observe20
+  text_embedding_cache_dir: /inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/tool_adaptation_Project/TTTdynamics/repos/FastWAM/data/text_embeds_cache/ttt_dynamic_carrier_slow100_observe10
   context_len: 128

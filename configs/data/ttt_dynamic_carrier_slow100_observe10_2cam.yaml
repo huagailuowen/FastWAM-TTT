@@ -23,7 +23,7 @@ train:
         shape: 8
   num_frames: 33
   global_sample_stride: 1
-  action_video_freq_ratio: 2
+  action_video_freq_ratio: 4
   video_size: [224, 448]
   camera_key: null
   val_set_proportion: 0.0

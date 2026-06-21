@@ -51,6 +51,8 @@ class Wan22Trainer:
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
+        self.skip_nonfinite_loss = bool(cfg.get("skip_nonfinite_loss", False))
+        self.skip_nonfinite_grad = bool(cfg.get("skip_nonfinite_grad", False))
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
@@ -757,11 +759,65 @@ class Wan22Trainer:
                 else:
                     loss, loss_dict = loss_result
                     backward_done = False
+                loss_is_finite = bool(torch.isfinite(loss.detach()).all().item())
+                if not loss_is_finite:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    loss_value = float(loss.detach().float().item())
+                    if not self.skip_nonfinite_loss:
+                        raise RuntimeError(
+                            f"Non-finite training loss at epoch={self.epoch} "
+                            f"batch_in_epoch={self.batch_in_epoch}: {loss_value}"
+                        )
+                    if self.accelerator.sync_gradients:
+                        self.global_step += 1
+                        if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
+                            logger.warning(
+                                "[train] epoch=%d step=%d/%d skipped non-finite loss=%s",
+                                self.epoch,
+                                self.global_step,
+                                self.max_steps,
+                                str(loss_value),
+                            )
+                    continue
                 if not backward_done:
                     self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    nonfinite_grad_tensors = 0
+                    nonfinite_grad_values = 0
+                    for param in self.model.parameters():
+                        grad = getattr(param, "grad", None)
+                        if grad is None:
+                            continue
+                        finite_mask = torch.isfinite(grad)
+                        if bool(finite_mask.all().item()):
+                            continue
+                        nonfinite_grad_tensors += 1
+                        nonfinite_grad_values += int((~finite_mask).sum().item())
+                        if not self.skip_nonfinite_grad:
+                            raise RuntimeError(
+                                "Non-finite gradient detected before optimizer step: "
+                                f"tensors={nonfinite_grad_tensors} values={nonfinite_grad_values}"
+                            )
+                        grad.data = torch.where(finite_mask, grad, torch.zeros_like(grad))
+                    if self.max_grad_norm > 0.0:
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm_tensor = torch.as_tensor(
+                            grad_norm,
+                            device=loss.device,
+                            dtype=torch.float32,
+                        )
+                        if not bool(torch.isfinite(grad_norm_tensor).all().item()):
+                            raise RuntimeError(
+                                f"Non-finite gradient norm before optimizer step: {float(grad_norm_tensor.item())}"
+                            )
+                    else:
+                        grad_norm_tensor = torch.full(
+                            (),
+                            float("nan"),
+                            device=loss.device,
+                            dtype=torch.float32,
+                        )
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
@@ -776,7 +832,8 @@ class Wan22Trainer:
                         global_loss_metrics[key] = float(
                             self.accelerator.gather(metric_tensor).mean().item()
                         )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+                    global_loss_metrics["nonfinite_grad_tensors"] = float(nonfinite_grad_tensors)
+                    global_loss_metrics["nonfinite_grad_values"] = float(nonfinite_grad_values)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
@@ -792,6 +849,8 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
+                        if self.max_grad_norm > 0.0:
+                            description += "grad_norm=%.4f " % global_grad_norm
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
                             steps_per_sec,

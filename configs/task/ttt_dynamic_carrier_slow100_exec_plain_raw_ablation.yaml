@@ -1,21 +1,13 @@
 # @package _global_
 
 defaults:
-  - override /data: ttt_dynamic_carrier_slow100_observe10_2cam
+  - override /data: ttt_dynamic_carrier_slow100_exec_plain_2cam
   - override /model: fastwam
   - _self_
 
 batch_size: 4
-num_workers: 4
+num_workers: 2
 gradient_accumulation_steps: 1
-
-data:
-  train:
-    # Raw SFT trains only on execution chunks. The passive 100-frame prefix is
-    # metadata/context for TTT variants, not an action target for the raw policy.
-    action_video_freq_ratio: 4
-    stage1_execution_only: true
-    ttt_observation_instruction: null
 
 model:
   mot_checkpoint_mixed_attn: true
@@ -25,9 +17,9 @@ model:
 lr_scheduler_type: "cosine"
 learning_rate: 2.0e-5
 num_epochs: 1
-max_steps: 10000
+max_steps: 200
 log_every: 5
-save_every: 1000
+save_every: 100
 keep_last_checkpoints: 2
 eval_every: 0
 eval_num_inference_steps: 10
@@ -37,4 +29,4 @@ resume: ./checkpoints/fastwam_release/libero_uncond_2cam224.pt
 
 wandb:
   enabled: false
-  name: ttt_dynamic_carrier_slow100_raw_2cam224_ft
+  name: ttt_dynamic_carrier_slow100_exec_plain_raw_ablation

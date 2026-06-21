@@ -651,6 +651,8 @@ def _predict_action_chunk(
             pred = model.infer_action(**infer_kwargs)
 
     action = _denormalize_action(pred["action"], processor)[0]
+    if bool(cfg.EVALUATION.get("zero_action_rotation", False)):
+        action[..., 3:6] = 0.0
     action[..., -1] = action[..., -1] * 2 - 1
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", True)):
@@ -675,11 +677,14 @@ def _fast_forward_with_dummy_action(
     env: DynamicCarrierEnv,
     obs: dict[str, Any],
     steps: int,
+    gripper: Optional[float] = None,
 ) -> tuple[dict[str, Any], bool, int]:
     done = False
     completed = 0
     for _ in range(max(int(steps), 0)):
         action = np.asarray(get_libero_dummy_action(), dtype=np.float32)
+        if gripper is not None:
+            action[-1] = float(gripper)
         obs, _, done, _ = env.step(action)
         completed += 1
         if done:
@@ -748,6 +753,11 @@ def run_episode(
                 env,
                 obs,
                 int(start_frame),
+                gripper=(
+                    float(cfg.EVALUATION.get("fast_forward_dummy_gripper"))
+                    if cfg.EVALUATION.get("fast_forward_dummy_gripper", None) is not None
+                    else None
+                ),
             )
             elapsed_steps += int(pre_rollout_steps)
 
@@ -981,6 +991,11 @@ def run_observe_then_act_episode(
                 env,
                 obs,
                 observe_start_frame,
+                gripper=(
+                    float(cfg.EVALUATION.get("fast_forward_dummy_gripper"))
+                    if cfg.EVALUATION.get("fast_forward_dummy_gripper", None) is not None
+                    else None
+                ),
             )
             elapsed_steps += int(pre_observe_steps)
 
@@ -1371,6 +1386,7 @@ def main(cfg: DictConfig) -> dict[str, Any]:
             int(_get_observe_then_act_update_interval(cfg)) if observe_then_act_chunks > 0 else None
         ),
         "in_domain_execution_start": bool(in_domain_execution_start),
+        "zero_action_rotation": bool(cfg.EVALUATION.get("zero_action_rotation", False)),
         "grasp_release_distance_override": (
             float(cfg.EVALUATION.get("grasp_release_distance_override"))
             if cfg.EVALUATION.get("grasp_release_distance_override", None) is not None

@@ -5,15 +5,15 @@ defaults:
   - override /model: fastwam
   - _self_
 
-batch_size: 16
+batch_size: 4
 num_workers: 4
 gradient_accumulation_steps: 1
 
 data:
   train:
     # Stage1 samples only from the execution part of type2 demos.
-    # Future-video supervision stays at every 2 raw frames; action horizon remains 32.
-    action_video_freq_ratio: 2
+    # Future-video supervision uses every 4 raw frames; action horizon remains 32.
+    action_video_freq_ratio: 4
     stage1_execution_only: true
     ttt_observation_instruction: null
 
