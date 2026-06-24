@@ -119,7 +119,12 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
-        warmup_steps = int(total_train_steps * 0.05)
+        explicit_warmup_steps = cfg.get("lr_warmup_steps", None)
+        if explicit_warmup_steps is None:
+            warmup_fraction = float(cfg.get("lr_warmup_fraction", 0.05))
+            warmup_steps = int(total_train_steps * warmup_fraction)
+        else:
+            warmup_steps = int(explicit_warmup_steps)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
             total_train_steps=total_train_steps,
