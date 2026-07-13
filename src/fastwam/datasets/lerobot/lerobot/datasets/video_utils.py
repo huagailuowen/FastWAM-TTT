@@ -69,10 +69,58 @@ def decode_video_frames(
                 f"torchcodec video decode failed ({type(err).__name__}: {err}); falling back to torchvision/pyav."
             )
             return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend="pyav")
-    elif backend in ["pyav", "video_reader"]:
+    elif backend == "pyav":
+        return decode_video_frames_pyav(video_path, timestamps, tolerance_s)
+    elif backend == "video_reader":
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
+
+
+def decode_video_frames_pyav(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+) -> torch.Tensor:
+    """Decode short episode videos directly with PyAV.
+
+    The torchvision wheels used by the original LeRobot v2.1 environment do
+    not provide ``torchvision.io.VideoReader``. Decoding the complete episode
+    is inexpensive here and avoids requiring a locally compiled torchvision.
+    """
+    loaded_frames = []
+    loaded_ts = []
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        fallback_fps = float(stream.average_rate) if stream.average_rate else 0.0
+        for frame_index, frame in enumerate(container.decode(stream)):
+            if frame.pts is not None and frame.time_base is not None:
+                timestamp = float(frame.pts * frame.time_base)
+            elif fallback_fps > 0:
+                timestamp = frame_index / fallback_fps
+            else:
+                raise RuntimeError(f"Cannot determine frame timestamps for {video_path}")
+            array = frame.to_ndarray(format="rgb24")
+            loaded_frames.append(torch.from_numpy(array).permute(2, 0, 1))
+            loaded_ts.append(timestamp)
+
+    if not loaded_frames:
+        raise RuntimeError(f"No video frames decoded from {video_path}")
+
+    query_ts = torch.tensor(timestamps, dtype=torch.float32)
+    loaded_ts_tensor = torch.tensor(loaded_ts, dtype=torch.float32)
+    dist = torch.cdist(query_ts[:, None], loaded_ts_tensor[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+    is_within_tol = min_ < tolerance_s
+    assert is_within_tol.all(), (
+        f"One or several query timestamps violate the tolerance "
+        f"({min_[~is_within_tol]} > {tolerance_s=}).\n"
+        f"queried timestamps: {query_ts}\n"
+        f"loaded timestamps: {loaded_ts_tensor}\n"
+        f"video: {video_path}\nbackend: pyav"
+    )
+
+    return torch.stack([loaded_frames[index] for index in argmin_]).to(torch.float32) / 255
 
 
 def decode_video_frames_torchvision(
